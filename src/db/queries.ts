@@ -23,8 +23,8 @@ import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
 import { semanticRangesOverlap, assertPairwiseSemanticOverlap,
-  semanticCollisionNodeId } from '../semantic/cpp/facts';
-import { generateNodeId } from '../extraction/tree-sitter-helpers';
+  areDisjointCppIdCollisions } from '../semantic/cpp/facts';
+import { generateNodeId, semanticCollisionNodeId } from '../extraction/tree-sitter-helpers';
 
 /**
  * Files that should not be candidates for "dominant file" detection: test/spec
@@ -374,15 +374,26 @@ export class QueryBuilder {
   // ===========================================================================
 
   /**
-   * @brief 普通节点复用 clangd ID 时核实源码身份，防止 UPSERT 误接管其他定义。
+   * @brief 普通 C/C++ 节点写入前核实同 ID 源码身份，并消歧合法独立定义。
    * @param[in] node 即将写入的普通提取节点
-   * @return 无；同 ID 旧节点不是同一源码定义时抛错
+   * @return 可安全写入的节点；真实 baseline 碰撞时返回列号 ID，伪造 ID 时抛错
    */
-  private verifySemanticNodeIdentity(node: Node): void {
+  private verifySemanticNodeIdentity(node: Node): Node {
     if (node.semanticOrigin || (node.language !== 'c' && node.language !== 'cpp') ||
-        (node.kind !== 'function' && node.kind !== 'method')) return;
-    const existing = this.db.prepare('SELECT * FROM nodes WHERE id = ? AND semantic_origin = ?')
-      .get(node.id, 'clangd') as NodeRow | undefined;
+        (node.kind !== 'function' && node.kind !== 'method')) return node;
+    const ordinary = (this.db.prepare(`
+      SELECT * FROM nodes WHERE file_path = ? AND kind = ? AND name = ?
+        AND start_line = ? AND semantic_origin IS NULL
+    `).all(node.filePath, node.kind, node.name, node.startLine) as NodeRow[])
+      .filter(candidate => semanticRangesOverlap(node, rowToNode(candidate)));
+    if (ordinary.length > 1) throw new Error('Cannot disambiguate ordinary C/C++ node identity');
+    if (ordinary[0] && ordinary[0].id !== node.id &&
+        (node.id === generateNodeId(node.filePath, node.kind, node.name, node.startLine) ||
+          node.id === semanticCollisionNodeId(node))) {
+      return { ...node, id: ordinary[0].id };
+    }
+    const existing = this.db.prepare('SELECT * FROM nodes WHERE id = ?')
+      .get(node.id) as NodeRow | undefined;
     if (existing) {
       if (existing.file_path !== node.filePath || existing.kind !== node.kind ||
           existing.name !== node.name) {
@@ -391,10 +402,21 @@ export class QueryBuilder {
       if (semanticRangesOverlap(node, {
           startLine: existing.start_line, startColumn: existing.start_column,
           endLine: existing.end_line, endColumn: existing.end_column,
-        })) return;
+        })) return node;
       if (existing.start_line !== node.startLine ||
           node.id !== generateNodeId(node.filePath, node.kind, node.name, node.startLine)) {
         throw new Error('Ordinary node conflicts with existing semantic node ID');
+      }
+      if (!existing.semantic_origin) {
+        // 已有普通定义保留原 ID；另一独立定义按其自身列号接管已有语义身份。
+        const replacement = { ...node, id: semanticCollisionNodeId(node) };
+        const atTarget = this.db.prepare('SELECT * FROM nodes WHERE id = ?')
+          .get(replacement.id) as NodeRow | undefined;
+        if (atTarget && (atTarget.file_path !== node.filePath || atTarget.kind !== node.kind ||
+            atTarget.name !== node.name || !semanticRangesOverlap(node, rowToNode(atTarget)))) {
+          throw new Error('Ordinary node conflicts with existing semantic node ID');
+        }
+        return replacement;
       }
       const relocated = semanticCollisionNodeId({ filePath: node.filePath, kind: node.kind,
         name: node.name, startLine: existing.start_line, startColumn: existing.start_column });
@@ -420,6 +442,47 @@ export class QueryBuilder {
       this.deleteNode(node.id);
       this.nodeCache.delete(relocated);
     }
+    return node;
+  }
+
+  /**
+   * @brief 同批真实同行 C/C++ 定义优先保留旧身份匹配者的行号 ID，其余按列号消歧。
+   * @param[in] nodes 本次批量写入的普通节点
+   * @return 原顺序且各独立源码定义拥有不同 ID 的节点列表
+   */
+  private disambiguateBatchNodeIds(nodes: Node[]): Node[] {
+    const groups = new Map<string, number[]>();
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i]!;
+      if (node.semanticOrigin || (node.language !== 'c' && node.language !== 'cpp') ||
+          (node.kind !== 'function' && node.kind !== 'method')) continue;
+      const indices = groups.get(node.id) ?? [];
+      indices.push(i);
+      groups.set(node.id, indices);
+    }
+    const prepared = [...nodes];
+    const occupied = new Set(nodes.map(node => node.id));
+    for (const [id, indices] of groups) {
+      if (indices.length < 2) continue;
+      if (!areDisjointCppIdCollisions(indices.map(index => nodes[index]!))) continue;
+      const first = nodes[indices[0]!]!;
+      const existing = this.db.prepare('SELECT * FROM nodes WHERE id = ?').get(id) as NodeRow | undefined;
+      const matching = existing ? indices.filter(index =>
+        existing.file_path === first.filePath && existing.kind === first.kind &&
+        existing.name === first.name && semanticRangesOverlap(nodes[index]!, rowToNode(existing))) : [];
+      if (matching.length > 1) throw new Error('Cannot disambiguate ordinary C/C++ node identity');
+      const keep = matching[0] ?? indices.reduce((best, index) =>
+        nodes[index]!.startColumn < nodes[best]!.startColumn ? index : best);
+      for (const index of indices) {
+        if (index === keep) continue;
+        const node = nodes[index]!;
+        const replacement = semanticCollisionNodeId(node);
+        if (occupied.has(replacement)) throw new Error('C/C++ column node ID collides with existing identity');
+        occupied.add(replacement);
+        prepared[index] = { ...node, id: replacement };
+      }
+    }
+    return prepared;
   }
 
   /**
@@ -528,7 +591,8 @@ export class QueryBuilder {
     this.nodeCache.delete(node.id);
 
     this.db.transaction(() => {
-      this.verifySemanticNodeIdentity(node);
+      node = this.verifySemanticNodeIdentity(node);
+      this.nodeCache.delete(node.id);
       this.stmts.insertNode!.run({
         id: node.id,
         kind: node.kind,
@@ -580,16 +644,21 @@ export class QueryBuilder {
   }
 
   /**
-   * Insert multiple nodes in a transaction
+   * @brief 在事务内插入节点，真实 C/C++ ID 碰撞按源码范围消歧。
+   * @param[in] nodes 待写入节点，缺少必填字段的节点仍按原规则跳过
+   * @return 实际写入的节点及 canonical ID，顺序与有效输入一致
    */
-  insertNodes(nodes: Node[]): void {
-    this.db.transaction(() => {
+  insertNodes(nodes: Node[]): Node[] {
+    return this.db.transaction(() => {
+      const preparedNodes = this.disambiguateBatchNodeIds(nodes);
       // Bulk path: same semantics as insertNode() per row (validation, cache
       // invalidation, segment vocab), but bound as multi-row INSERTs — the
       // per-.run() call overhead dominates the store phase on full indexes.
       const rows: unknown[][] = [];
       const segmentRows: unknown[][] = [];
-      for (const node of nodes) {
+      const effectiveNodes: Node[] = [];
+      for (const original of preparedNodes) {
+        let node = original;
         if (!node.id || !node.kind || !node.name || !node.filePath || !node.language) {
           console.error('[CodeGraph] Skipping node with missing required fields:', {
             id: node.id,
@@ -601,7 +670,9 @@ export class QueryBuilder {
           continue;
         }
         this.nodeCache.delete(node.id);
-        this.verifySemanticNodeIdentity(node);
+        node = this.verifySemanticNodeIdentity(node);
+        this.nodeCache.delete(node.id);
+        effectiveNodes.push(node);
         rows.push([
           node.id,
           node.kind,
@@ -658,13 +729,18 @@ export class QueryBuilder {
         segmentRows
       );
       // 基线行必须先存在：迁移 membership 时立即检查目标外键。
-      for (const node of nodes) if (node.id && node.kind && node.name && node.filePath && node.language) {
+      for (const node of effectiveNodes) {
         this.takeOverSemanticNodes(node);
       }
+      return effectiveNodes;
     })();
   }
 
   /**
+   * @brief 在单次事务内存储文件提取结果，并映射碰撞节点对应的边与引用端点。
+   * @param[in] bundle 已过滤非法节点和端点的单文件提取结果
+   * @return 实际存储的 canonical 节点，顺序与有效输入一致
+   *
    * Store one file's whole extraction bundle — nodes, edges, unresolved refs,
    * and the file record — in a SINGLE transaction. The bulk-index path calls
    * this once per file instead of opening one transaction per table (#1015
@@ -680,15 +756,28 @@ export class QueryBuilder {
     edges: Edge[];
     refs: UnresolvedReference[];
     file: FileRecord;
-  }): void {
-    this.db.transaction(() => {
-      this.insertNodes(bundle.nodes);
+  }): Node[] {
+    return this.db.transaction(() => {
+      const validNodes = bundle.nodes.filter(node => node.id && node.kind && node.name && node.filePath && node.language);
+      const effective = this.insertNodes(validNodes);
+      const remap = new Map<string, string>();
+      const ambiguous = new Set<string>();
+      for (let i = 0; i < validNodes.length; i++) {
+        const original = validNodes[i]!.id;
+        const canonical = effective[i]!.id;
+        if (remap.has(original) && remap.get(original) !== canonical) ambiguous.add(original);
+        remap.set(original, canonical);
+      }
+      if (bundle.edges.some(edge => ambiguous.has(edge.source) || ambiguous.has(edge.target)) ||
+          bundle.refs.some(ref => ambiguous.has(ref.fromNodeId))) {
+        throw new Error('Ambiguous C/C++ extraction endpoint; disambiguate before emitting references');
+      }
       if (bundle.edges.length > 0) {
         const rows: unknown[][] = [];
         for (const edge of bundle.edges) {
           rows.push([
-            edge.source,
-            edge.target,
+            remap.get(edge.source) ?? edge.source,
+            remap.get(edge.target) ?? edge.target,
             edge.kind,
             edge.metadata ? JSON.stringify(edge.metadata) : null,
             edge.line ?? null,
@@ -703,8 +792,11 @@ export class QueryBuilder {
           rows
         );
       }
-      if (bundle.refs.length > 0) this.insertUnresolvedRefsBatch(bundle.refs);
+      if (bundle.refs.length > 0) this.insertUnresolvedRefsBatch(bundle.refs.map(ref => ({
+        ...ref, fromNodeId: remap.get(ref.fromNodeId) ?? ref.fromNodeId,
+      })));
       this.upsertFile(bundle.file);
+      return effective;
     })();
   }
 

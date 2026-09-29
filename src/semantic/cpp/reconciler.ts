@@ -2,11 +2,10 @@
 import * as path from 'path';
 import { SqliteDatabase } from '../../db/sqlite-adapter';
 import { QueryBuilder } from '../../db/queries';
-import { generateNodeId } from '../../extraction/tree-sitter-helpers';
+import { generateNodeId, semanticCollisionNodeId } from '../../extraction/tree-sitter-helpers';
 import { Node } from '../../types';
 import { SemanticFactCollection } from './index';
-import { SemanticSymbolFact, semanticRangesOverlap, assertPairwiseSemanticOverlap,
-  semanticCollisionNodeId } from './facts';
+import { SemanticSymbolFact, semanticRangesOverlap, assertPairwiseSemanticOverlap } from './facts';
 
 /**
  * @brief 拒绝未能安全映射到图节点的事实，避免部分 SQL 更新后被当作完整清单提交。

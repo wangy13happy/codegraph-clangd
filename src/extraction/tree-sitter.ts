@@ -16,7 +16,9 @@ import {
   UnresolvedReference,
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
-import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring } from './tree-sitter-helpers';
+import { generateNodeId, semanticCollisionNodeId, getNodeText, getChildByField,
+  getPrecedingDocstring } from './tree-sitter-helpers';
+import { semanticRangesOverlap } from '../semantic/cpp/facts';
 import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandidate } from './function-ref';
 import { isGeneratedFile } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
@@ -394,6 +396,7 @@ export class TreeSitterExtractor {
   private source: string;
   private tree: Tree | null = null;
   private nodes: Node[] = [];
+  private cppDefinitionIds = new Map<string, Node>();
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
   // Value-reference edges (default ON; set CODEGRAPH_VALUE_REFS=0 to disable; see flushValueRefs).
@@ -1329,7 +1332,7 @@ export class TreeSitterExtractor {
       return null;
     }
 
-    const id = generateNodeId(this.filePath, kind, name, node.startPosition.row + 1);
+    let id = generateNodeId(this.filePath, kind, name, node.startPosition.row + 1);
 
     // Some grammars (e.g. Dart) model a function/method body as a *sibling* of
     // the signature node, so the declaration node's own range is just the
@@ -1342,6 +1345,26 @@ export class TreeSitterExtractor {
       const body = this.extractor?.resolveBody?.(node, this.extractor.bodyField);
       if (body && body.endPosition.row + 1 > endLine) {
         endLine = body.endPosition.row + 1;
+      }
+    }
+
+    if ((this.language === 'c' || this.language === 'cpp') &&
+        (kind === 'function' || kind === 'method')) {
+      const previous = this.cppDefinitionIds.get(id);
+      if (previous && (previous.filePath !== this.filePath || previous.kind !== kind ||
+          previous.name !== name || previous.startLine !== node.startPosition.row + 1)) {
+        throw new Error('C/C++ node ID collides with unrelated identity');
+      }
+      if (previous && !semanticRangesOverlap(previous, {
+        startLine: node.startPosition.row + 1, startColumn: node.startPosition.column,
+        endLine, endColumn: node.endPosition.column,
+      })) {
+        // 在生成边和引用之前消歧；后续节点栈及端点因此天然指向正确的定义。
+        id = semanticCollisionNodeId({ filePath: this.filePath, kind, name,
+          startLine: node.startPosition.row + 1, startColumn: node.startPosition.column });
+        if (this.cppDefinitionIds.has(id)) {
+          throw new Error('C/C++ column node ID collides with existing identity');
+        }
       }
     }
 
@@ -1370,6 +1393,8 @@ export class TreeSitterExtractor {
     }
 
     this.nodes.push(newNode);
+    if ((this.language === 'c' || this.language === 'cpp') &&
+        (kind === 'function' || kind === 'method')) this.cppDefinitionIds.set(id, newNode);
 
     // Add containment edge from parent
     if (this.nodeStack.length > 0) {

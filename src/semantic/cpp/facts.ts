@@ -1,8 +1,9 @@
 /** @file clangd LSP 坐标、源码身份和内存语义事实。 */
 import * as fs from 'fs';
 import * as path from 'path';
-import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
+import { generateNodeId } from '../../extraction/tree-sitter-helpers';
+import type { Node } from '../../types';
 import { isWithinProject } from './compile-database';
 import { LspCallHierarchyItem, LspDocumentSymbol, LspIncomingCall, LspPosition,
   LspRange, LspSymbolInformation } from './clangd-client';
@@ -23,19 +24,6 @@ export interface SemanticSymbolFact extends SemanticSymbolIdentity {
 }
 
 /**
- * @brief 为真正碰撞的同行同名 C/C++ 定义生成稳定的列号消歧 ID。
- * @param[in] identity 定义的文件、类型、名称和起始行列坐标
- * @return 与常规行号 ID 不同、同一源码位置跨采集保持不变的节点 ID
- */
-export function semanticCollisionNodeId(identity: Pick<SemanticSymbolIdentity,
-  'filePath' | 'kind' | 'name' | 'startLine' | 'startColumn'>): string {
-  const hash = createHash('sha256').update(JSON.stringify([
-    identity.filePath, identity.kind, identity.name, identity.startLine, identity.startColumn,
-  ])).digest('hex').slice(0, 32);
-  return `${identity.kind}:${hash}`;
-}
-
-/**
  * @brief 判断同名同文件定义的源码范围是否足以表示同一个函数体。
  * @param[in] left 第一份定义的行列范围
  * @param[in] right 第二份定义的行列范围
@@ -52,6 +40,33 @@ export function semanticRangesOverlap(left: Pick<SemanticSymbolIdentity, 'startL
   const sharedLines = end - start + 1;
   const shorter = Math.min(left.endLine - left.startLine + 1, right.endLine - right.startLine + 1);
   return left.endLine === right.endLine || sharedLines * 2 >= shorter;
+}
+
+/**
+ * @brief 判断重复节点 ID 是否来自可按列号分离的真实同行 C/C++ 定义。
+ * @param[in] candidates 同一 ID 的源码节点组
+ * @return 全部互不重叠且身份可验证时为 true；全体重叠为 false；混合或伪造身份抛错
+ */
+export function areDisjointCppIdCollisions(candidates: ReadonlyArray<Pick<Node,
+  'id' | 'filePath' | 'kind' | 'name' | 'startLine' | 'startColumn' | 'endLine' | 'endColumn'>>): boolean {
+  let disjoint = false;
+  let overlapping = false;
+  // 仅重复 ID 小组做两两检查；桥接范围不能据此归并或消歧，仍需拒写。
+  for (let i = 0; i < candidates.length; i++) {
+    for (let j = i + 1; j < candidates.length; j++) {
+      if (semanticRangesOverlap(candidates[i]!, candidates[j]!)) overlapping = true;
+      else disjoint = true;
+    }
+  }
+  if (!disjoint) return false;
+  const first = candidates[0]!;
+  if (overlapping || (first.kind !== 'function' && first.kind !== 'method') ||
+      first.id !== generateNodeId(first.filePath, first.kind, first.name, first.startLine) ||
+      candidates.some(node => node.id !== first.id || node.filePath !== first.filePath ||
+        node.kind !== first.kind || node.name !== first.name || node.startLine !== first.startLine)) {
+    throw new Error('Cannot disambiguate C/C++ node identity');
+  }
+  return true;
 }
 
 /**

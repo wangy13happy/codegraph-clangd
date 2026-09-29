@@ -2460,7 +2460,7 @@ export class ExtractionOrchestrator {
     if (fitsOneChunk) {
       // Snapshot/re-resolution of cross-file incoming edges (below) still runs
       // for the sync path; on a fresh bulk index crossFileIncomingEdges is [].
-      this.queries.storeFileBundle({
+      const storedNodes = this.queries.storeFileBundle({
         nodes: validNodes,
         edges: validEdges,
         refs: validRefs,
@@ -2477,21 +2477,41 @@ export class ExtractionOrchestrator {
         },
       });
       if (crossFileIncomingEdges.length > 0) {
-        this.reattachCrossFileEdges(crossFileIncomingEdges, validNodes);
+        this.reattachCrossFileEdges(crossFileIncomingEdges, storedNodes);
       }
       return;
     }
 
     // Insert nodes (chunked — see STORE_CHUNK above)
+    const storedNodeIds = new Map<string, string>();
+    const ambiguousNodeIds = new Set<string>();
     for (let i = 0; i < validNodes.length; i += STORE_CHUNK) {
-      this.queries.insertNodes(validNodes.slice(i, i + STORE_CHUNK));
+      const chunk = validNodes.slice(i, i + STORE_CHUNK);
+      const stored = this.queries.insertNodes(chunk);
+      for (let j = 0; j < chunk.length; j++) {
+        const original = chunk[j]!.id;
+        const canonical = stored[j]!.id;
+        if (storedNodeIds.has(original) && storedNodeIds.get(original) !== canonical) {
+          ambiguousNodeIds.add(original);
+        }
+        storedNodeIds.set(original, canonical);
+        validNodes[i + j] = stored[j]!;
+      }
       await onYield?.();
+    }
+    // 提取器已在生成边/ref 前消歧；这里仍拒绝无归属证据的重复端点，不能猜测目标。
+    if (validEdges.some(edge => ambiguousNodeIds.has(edge.source) || ambiguousNodeIds.has(edge.target)) ||
+        validRefs.some(ref => ambiguousNodeIds.has(ref.fromNodeId))) {
+      throw new Error('Ambiguous C/C++ extraction endpoint; disambiguate before emitting references');
     }
 
     // Filter edges to only reference nodes that were actually inserted
     if (validEdges.length > 0) {
       for (let i = 0; i < validEdges.length; i += STORE_CHUNK) {
-        this.queries.insertEdges(validEdges.slice(i, i + STORE_CHUNK));
+        this.queries.insertEdges(validEdges.slice(i, i + STORE_CHUNK).map(edge => ({ ...edge,
+          source: storedNodeIds.get(edge.source) ?? edge.source,
+          target: storedNodeIds.get(edge.target) ?? edge.target,
+        })));
         await onYield?.();
       }
     }
@@ -2520,7 +2540,9 @@ export class ExtractionOrchestrator {
 
     // Insert unresolved references in batch with denormalized filePath/language
     for (let i = 0; i < validRefs.length; i += STORE_CHUNK) {
-      this.queries.insertUnresolvedRefsBatch(validRefs.slice(i, i + STORE_CHUNK));
+      this.queries.insertUnresolvedRefsBatch(validRefs.slice(i, i + STORE_CHUNK).map(ref => ({ ...ref,
+        fromNodeId: storedNodeIds.get(ref.fromNodeId) ?? ref.fromNodeId,
+      })));
       await onYield?.();
     }
 

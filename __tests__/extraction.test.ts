@@ -10,6 +10,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
+import { TreeSitterExtractor } from '../src/extraction/tree-sitter';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
 import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
@@ -17,6 +18,52 @@ import { normalizePath } from '../src/utils';
 beforeAll(async () => {
   await initGrammars();
   await loadAllGrammars();
+});
+
+it('keeps same-line C++ definitions and their own references distinct in both extractors', () => {
+  const source = 'int feature() { missingLeft(); return 1; } int feature(int x) { missingRight(); return x; }\n';
+  for (const result of [new TreeSitterExtractor('variant.cpp', source, 'cpp').extract(),
+    extractFromSource('variant.cpp', source, 'cpp')]) {
+    expect(result.errors).toEqual([]);
+    const definitions = result.nodes.filter(node => node.kind === 'function' && node.name === 'feature')
+      .sort((a, b) => a.startColumn - b.startColumn);
+    expect(definitions).toHaveLength(2);
+    expect(definitions[0]!.id).not.toBe(definitions[1]!.id);
+    expect(result.edges.filter(edge => edge.kind === 'contains' && edge.source === 'file:variant.cpp')
+      .map(edge => edge.target)).toEqual(definitions.map(node => node.id));
+    expect(result.unresolvedReferences.filter(ref => ref.referenceName.startsWith('missing'))
+      .map(ref => [ref.referenceName, ref.fromNodeId])).toEqual([
+        ['missingLeft', definitions[0]!.id], ['missingRight', definitions[1]!.id],
+      ]);
+  }
+});
+
+it.each([false, true])('stores same-line C++ overloads with independent containment and resolved calls (chunked=%s)', async chunked => {
+  const directory = createTempDir();
+  let graph: CodeGraph | undefined;
+  try {
+    fs.writeFileSync(path.join(directory, 'variant.cpp'),
+      'void leftTarget() {}\nvoid rightTarget() {}\n' +
+      'int feature() { leftTarget(); return 1; } int feature(int x) { rightTarget(); return x; }\n' +
+      (chunked ? Array.from({ length: 2001 }, (_, i) => `void filler_${i}() {}`).join('\n') : ''));
+    graph = CodeGraph.initSync(directory);
+    const indexed = chunked ? await graph.indexFiles(['variant.cpp']) : await graph.indexAll();
+    expect(indexed.success).toBe(true);
+    if (chunked) expect(graph.getNodesByKind('function').length).toBeGreaterThan(2000);
+    graph.resolveReferences();
+    const definitions = graph.getNodesByKind('function').filter(node => node.name === 'feature')
+      .sort((a, b) => a.startColumn - b.startColumn);
+    expect(definitions).toHaveLength(2);
+    expect(definitions[0]!.id).not.toBe(definitions[1]!.id);
+    expect(graph.getOutgoingEdges('file:variant.cpp').filter(edge => edge.kind === 'contains')
+      .map(edge => edge.target)).toEqual(expect.arrayContaining(definitions.map(node => node.id)));
+    expect(definitions.map(node => graph!.getOutgoingEdges(node.id)
+      .filter(edge => edge.kind === 'calls').map(edge => graph!.getNode(edge.target)?.name)))
+      .toEqual([['leftTarget'], ['rightTarget']]);
+  } finally {
+    graph?.close();
+    cleanupTempDir(directory);
+  }
 });
 
 // Create a temporary directory for each test

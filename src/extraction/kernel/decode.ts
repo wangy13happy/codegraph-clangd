@@ -17,6 +17,8 @@ import type {
 } from '../../types';
 import { NODE_KINDS, EDGE_KINDS } from '../../types';
 import type { KernelBuffers } from './loader';
+import { semanticCollisionNodeId } from '../tree-sitter-helpers';
+import { areDisjointCppIdCollisions } from '../../semantic/cpp/facts';
 import {
   EDGE,
   EDGE_ROW_SIZE,
@@ -123,14 +125,48 @@ export function decodeExtractBuffers(
     nodes[i] = node;
   }
 
+  // 先消歧节点表，再按行索引还原端点；原始字符串 ID 无法证明定义归属时拒绝猜测。
+  const ambiguousIds = new Set<string>();
+  if (language === 'c' || language === 'cpp') {
+    const byId = new Map<string, number[]>();
+    for (let i = 0; i < nodes.length; i++) {
+      if (nodes[i]!.kind !== 'function' && nodes[i]!.kind !== 'method') continue;
+      const id = nodes[i]!.id;
+      const group = byId.get(id) ?? [];
+      group.push(i);
+      byId.set(id, group);
+    }
+    const occupied = new Set(idByRow);
+    for (const [id, indices] of byId) {
+      if (indices.length < 2) continue;
+      if (!areDisjointCppIdCollisions(indices.map(index => nodes[index]!))) continue;
+      ambiguousIds.add(id);
+      indices.sort((left, right) => nodes[left]!.startColumn - nodes[right]!.startColumn);
+      for (const index of indices.slice(1)) {
+        const node = nodes[index]!;
+        const replacement = semanticCollisionNodeId(node);
+        if (occupied.has(replacement)) throw new Error('C/C++ column node ID collides with existing identity');
+        occupied.add(replacement);
+        node.id = replacement;
+        idByRow[index] = replacement;
+      }
+    }
+  }
+
   const edges: Edge[] = new Array(edgeCount);
   for (let i = 0; i < edgeCount; i++) {
     const row = buffers.edges.subarray(i * EDGE_ROW_SIZE, (i + 1) * EDGE_ROW_SIZE);
     const sourceIdx = row.readUInt32LE(EDGE.sourceIdx);
     const targetIdx = row.readUInt32LE(EDGE.targetIdx);
+    const sourceId = sourceIdx === NONE ? str(arena, row, EDGE.sourceIdStr)! : idByRow[sourceIdx]!;
+    const targetId = targetIdx === NONE ? str(arena, row, EDGE.targetIdStr)! : idByRow[targetIdx]!;
+    if (sourceIdx === NONE && ambiguousIds.has(sourceId) ||
+        targetIdx === NONE && ambiguousIds.has(targetId)) {
+      throw new Error('Ambiguous C/C++ kernel edge endpoint');
+    }
     const edge: Edge = {
-      source: sourceIdx === NONE ? str(arena, row, EDGE.sourceIdStr)! : idByRow[sourceIdx]!,
-      target: targetIdx === NONE ? str(arena, row, EDGE.targetIdStr)! : idByRow[targetIdx]!,
+      source: sourceId,
+      target: targetId,
       kind: EDGE_KINDS[row.readUInt8(EDGE.kind)] as EdgeKind,
     };
     const line = u32opt(row, EDGE.line);
@@ -148,6 +184,10 @@ export function decodeExtractBuffers(
   for (let i = 0; i < refCount; i++) {
     const row = buffers.refs.subarray(i * REF_ROW_SIZE, (i + 1) * REF_ROW_SIZE);
     const fromIdx = row.readUInt32LE(REF.fromIdx);
+    const fromId = fromIdx === NONE ? str(arena, row, REF.fromIdStr)! : idByRow[fromIdx]!;
+    if (fromIdx === NONE && ambiguousIds.has(fromId)) {
+      throw new Error('Ambiguous C/C++ kernel reference source');
+    }
     const kindByte = row.readUInt8(REF.kind);
     // No filePath/language on ordinary refs: the wasm extractors emit them
     // WITHOUT the denormalized fields (the store fills `ref.filePath ??
@@ -157,7 +197,7 @@ export function decodeExtractBuffers(
     // mixin/trait `implements` refs — re-attach the decode call's own
     // filePath, which is that exact value.
     const ref: UnresolvedReference = {
-      fromNodeId: fromIdx === NONE ? str(arena, row, REF.fromIdStr)! : idByRow[fromIdx]!,
+      fromNodeId: fromId,
       referenceName: str(arena, row, REF.referenceName)!,
       referenceKind:
         kindByte === FUNCTION_REF_CODE

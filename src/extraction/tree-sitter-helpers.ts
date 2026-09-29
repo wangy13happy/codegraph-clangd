@@ -30,6 +30,20 @@ export function generateNodeId(
 }
 
 /**
+ * @brief 为真实同行同名 C/C++ 定义的行号 ID 碰撞生成稳定的列号 ID。
+ * @param[in] identity 定义的文件、类型、名称和起始行列坐标
+ * @return 与常规行号 ID 区分、同一位置重复提取时稳定的节点 ID
+ */
+export function semanticCollisionNodeId(identity: {
+  filePath: string; kind: NodeKind; name: string; startLine: number; startColumn: number;
+}): string {
+  const hash = crypto.createHash('sha256').update(JSON.stringify([
+    identity.filePath, identity.kind, identity.name, identity.startLine, identity.startColumn,
+  ])).digest('hex').slice(0, 32);
+  return `${identity.kind}:${hash}`;
+}
+
+/**
  * Extract text from a syntax node
  */
 export function getNodeText(node: SyntaxNode, source: string): string {

@@ -1,12 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import { DatabaseConnection } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
-import { generateNodeId } from '../src/extraction/tree-sitter-helpers';
-import { semanticCollisionNodeId } from '../src/semantic/cpp/facts';
+import { generateNodeId, semanticCollisionNodeId } from '../src/extraction/tree-sitter-helpers';
+import { extractFromSource } from '../src/extraction/tree-sitter';
+import { initGrammars, loadGrammarsForLanguages } from '../src/extraction/grammars';
 import { reconcileCppSemanticNodes } from '../src/semantic/cpp/reconciler';
 import { SemanticFactCollection } from '../src/semantic/cpp';
 import { Node } from '../src/types';
@@ -15,6 +16,11 @@ describe('C/C++ semantic node reconciliation', () => {
   let directory: string;
   let conn: DatabaseConnection;
   let queries: QueryBuilder;
+
+  beforeAll(async () => {
+    await initGrammars();
+    await loadGrammarsForLanguages(['c', 'cpp']);
+  });
 
   beforeEach(() => {
     directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-repair-'));
@@ -218,6 +224,121 @@ describe('C/C++ semantic node reconciliation', () => {
     expect(queries.getNodesByFile('variant.c')).toEqual([]);
     expect(queries.getNodeById(occupied.id)).toMatchObject({ name: 'unrelated', filePath: 'other.c' });
     expect(conn.getDb().prepare('SELECT * FROM semantic_configs').all()).toEqual([]);
+  });
+
+  it.each([false, true])('keeps both same-line baseline definitions in a batch (reverse=%s)', reverse => {
+    const first = { ...fact('one', 'variant.c', 'feature', 1, 1), endColumn: 18 };
+    const second = { ...fact('one', 'variant.c', 'feature', 1, 1), startColumn: 18, endColumn: 38 };
+    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [first, second]));
+    const left = { ...baseline('variant.c', 'feature', 1, 1), endColumn: 18 };
+    const right = { ...baseline('variant.c', 'feature', 1, 1), startColumn: 18, endColumn: 38 };
+    const caller = baseline('caller.c', 'caller', 20, 21);
+    queries.insertNode(caller);
+    queries.insertEdge({ source: caller.id, target: left.id, kind: 'references', line: 20,
+      metadata: { refName: 'feature', refKind: 'function_ref' } });
+    queries.insertNodes(reverse ? [right, left] : [left, right]);
+    const nodes = queries.getNodesByFile('variant.c').sort((a, b) => a.startColumn - b.startColumn);
+    expect(nodes).toHaveLength(2);
+    expect(nodes[0]).toMatchObject({ id: left.id, startColumn: 0 });
+    expect(nodes[1]).toMatchObject({ id: semanticCollisionNodeId(second), startColumn: 18 });
+    expect(nodes.map(node => node.semanticOrigin)).toEqual([undefined, undefined]);
+    expect(conn.getDb().prepare(`
+      SELECT n.start_column AS col, c.node_id FROM semantic_node_configs c
+      JOIN nodes n ON n.id = c.node_id ORDER BY n.start_column
+    `).all()).toEqual([{ col: 0, node_id: nodes[0]!.id }, { col: 18, node_id: nodes[1]!.id }]);
+    expect(conn.getDb().prepare('SELECT target FROM edges WHERE kind = ?').get('references'))
+      .toEqual({ target: nodes[0]!.id });
+  });
+
+  it('keeps the first baseline and its references when the second baseline takes over', () => {
+    const left = { ...baseline('variant.c', 'feature', 1, 1), endColumn: 18 };
+    queries.insertNode(left);
+    const caller = baseline('caller.c', 'caller', 20, 21);
+    queries.insertNode(caller);
+    queries.insertEdge({ source: caller.id, target: left.id, kind: 'references', line: 20,
+      metadata: { refName: 'feature', refKind: 'function_ref' } });
+    const rightFact = { ...fact('one', 'variant.c', 'feature', 1, 1), startColumn: 18, endColumn: 38 };
+    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [rightFact]));
+    const right = { ...baseline('variant.c', 'feature', 1, 1), startColumn: 18, endColumn: 38 };
+    queries.insertNode(right);
+    const nodes = queries.getNodesByFile('variant.c').sort((a, b) => a.startColumn - b.startColumn);
+    expect(nodes).toHaveLength(2);
+    expect(nodes[0]).toMatchObject({ id: left.id, startColumn: 0 });
+    expect(nodes[1]).toMatchObject({ id: semanticCollisionNodeId(rightFact), startColumn: 18 });
+    expect(nodes.map(node => node.semanticOrigin)).toEqual([undefined, undefined]);
+    expect(conn.getDb().prepare('SELECT node_id FROM semantic_node_configs').all())
+      .toEqual([{ node_id: nodes[1]!.id }]);
+    expect(conn.getDb().prepare('SELECT target FROM edges WHERE kind = ?').get('references'))
+      .toEqual({ target: left.id });
+  });
+
+  it('remaps a file bundle when an existing baseline owns the other same-line definition', () => {
+    const right = { ...baseline('variant.c', 'feature', 1, 1), startColumn: 18, endColumn: 38 };
+    queries.insertNode(right);
+    const caller = baseline('caller.c', 'caller', 20, 21);
+    queries.insertNode(caller);
+    queries.insertEdge({ source: caller.id, target: right.id, kind: 'references', line: 20,
+      metadata: { refName: 'feature', refKind: 'function_ref' } });
+    const left = { ...baseline('variant.c', 'feature', 1, 1), endColumn: 18 };
+    const extractedRight = { ...right, id: semanticCollisionNodeId(right) };
+    const file = { ...baseline('variant.c', 'variant.c', 1, 1), id: 'file:variant.c', kind: 'file' as const };
+    queries.storeFileBundle({ nodes: [file, left, extractedRight],
+      edges: [{ source: file.id, target: left.id, kind: 'contains' },
+        { source: file.id, target: extractedRight.id, kind: 'contains' }],
+      refs: [{ fromNodeId: left.id, referenceName: 'leftTarget', referenceKind: 'calls', line: 1, column: 4 },
+        { fromNodeId: extractedRight.id, referenceName: 'rightTarget', referenceKind: 'calls', line: 1, column: 24 }],
+      file: { path: 'variant.c', contentHash: 'test', language: 'c', size: 38, modifiedAt: 1, indexedAt: 1, nodeCount: 3 },
+    });
+    const nodes = queries.getNodesByFile('variant.c').filter(node => node.kind === 'function')
+      .sort((a, b) => a.startColumn - b.startColumn);
+    expect(nodes).toHaveLength(2);
+    expect(nodes.map(node => node.id)).toEqual([semanticCollisionNodeId(left), right.id]);
+    expect(conn.getDb().prepare('SELECT reference_name,from_node_id FROM unresolved_refs ORDER BY col').all())
+      .toEqual([{ reference_name: 'leftTarget', from_node_id: nodes[0]!.id },
+        { reference_name: 'rightTarget', from_node_id: right.id }]);
+    expect(conn.getDb().prepare('SELECT target FROM edges WHERE kind = ? ORDER BY id').all('contains'))
+      .toEqual(nodes.map(node => ({ target: node.id })));
+    expect(conn.getDb().prepare('SELECT target FROM edges WHERE kind = ?').get('references'))
+      .toEqual({ target: right.id });
+  });
+
+  it('rolls back an extraction bundle with ambiguous duplicate-ID endpoints instead of guessing', () => {
+    const left = { ...baseline('variant.c', 'feature', 1, 1), endColumn: 18 };
+    const right = { ...left, startColumn: 18, endColumn: 38 };
+    expect(() => queries.storeFileBundle({ nodes: [left, right], edges: [],
+      refs: [{ fromNodeId: left.id, referenceName: 'target', referenceKind: 'calls', line: 1, column: 4 }],
+      file: { path: 'variant.c', contentHash: 'test', language: 'c', size: 38, modifiedAt: 1, indexedAt: 1, nodeCount: 2 },
+    })).toThrow(/Ambiguous C\/C\+\+ extraction endpoint/);
+    expect(queries.getNodesByFile('variant.c')).toEqual([]);
+    expect(conn.getDb().prepare('SELECT * FROM unresolved_refs').all()).toEqual([]);
+    expect(queries.getFileByPath('variant.c')).toBeNull();
+  });
+
+  it.each([false, true])('takes over both semantic definitions from a real C++ extraction bundle (reverse=%s)', reverse => {
+    const result = extractFromSource('variant.cpp',
+      'int feature() { leftTarget(); return 1; } int feature(int x) { rightTarget(); return x; }\n', 'cpp');
+    expect(result.errors).toEqual([]);
+    const definitions = result.nodes.filter(node => node.kind === 'function' && node.name === 'feature')
+      .sort((a, b) => a.startColumn - b.startColumn);
+    const input = collection(['one'], definitions.map(node => ({ ...node, kind: 'function' as const, configId: 'one' })));
+    input.views[0]!.coveredFiles = ['variant.cpp'];
+    reconcileCppSemanticNodes(conn.getDb(), queries, input);
+    queries.storeFileBundle({ nodes: reverse ? [...result.nodes].reverse() : result.nodes,
+      edges: result.edges, refs: result.unresolvedReferences,
+      file: { path: 'variant.cpp', contentHash: 'test', language: 'cpp', size: 80, modifiedAt: 1, indexedAt: 1,
+        nodeCount: result.nodes.length },
+    });
+    const stored = queries.getNodesByFile('variant.cpp').filter(node => node.name === 'feature')
+      .sort((a, b) => a.startColumn - b.startColumn);
+    expect(stored.map(node => node.id)).toEqual(definitions.map(node => node.id));
+    expect(stored.map(node => node.semanticOrigin)).toEqual([undefined, undefined]);
+    expect(conn.getDb().prepare('SELECT node_id,definition_col FROM semantic_node_configs ORDER BY definition_col').all())
+      .toEqual(stored.map(node => ({ node_id: node.id, definition_col: node.startColumn })));
+    expect(conn.getDb().prepare(`
+      SELECT from_node_id,reference_name FROM unresolved_refs
+      WHERE reference_name IN ('leftTarget','rightTarget') ORDER BY col
+    `).all()).toEqual([{ from_node_id: stored[0]!.id, reference_name: 'leftTarget' },
+      { from_node_id: stored[1]!.id, reference_name: 'rightTarget' }]);
   });
 
   it('rolls back ID relocation when the following ordinary write fails', () => {
