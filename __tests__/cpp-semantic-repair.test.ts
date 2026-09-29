@@ -6,6 +6,7 @@ import { createHash } from 'crypto';
 import { DatabaseConnection } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
 import { generateNodeId } from '../src/extraction/tree-sitter-helpers';
+import { semanticCollisionNodeId } from '../src/semantic/cpp/facts';
 import { reconcileCppSemanticNodes } from '../src/semantic/cpp/reconciler';
 import { SemanticFactCollection } from '../src/semantic/cpp';
 import { Node } from '../src/types';
@@ -116,15 +117,124 @@ describe('C/C++ semantic node reconciliation', () => {
     const first = { ...fact('one', 'variant.c', 'static_helper', 1, 1), endColumn: 18 };
     const second = { ...fact('one', 'variant.c', 'static_helper', 1, 1),
       startColumn: 18, endColumn: 38 };
-    // 相同行号派生 ID 会碰撞；不安全事实应拒绝写入而不能覆盖首个定义。
+    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [second, first]));
+    const nodes = queries.getNodesByFile('variant.c').sort((a, b) => a.startColumn - b.startColumn);
+    expect(nodes).toHaveLength(2);
+    expect(nodes[0]!.id).toBe(generateNodeId('variant.c', 'function', 'static_helper', 1));
+    expect(nodes[1]!.id).not.toBe(nodes[0]!.id);
+    expect(conn.getDb().prepare(`
+      SELECT n.start_column AS col, c.node_id FROM semantic_node_configs c
+      JOIN nodes n ON n.id = c.node_id ORDER BY n.start_column
+    `).all()).toEqual([{ col: 0, node_id: nodes[0]!.id }, { col: 18, node_id: nodes[1]!.id }]);
+    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [first, second]));
+    expect(queries.getNodesByFile('variant.c').sort((a, b) => a.startColumn - b.startColumn)
+      .map(node => node.id)).toEqual(nodes.map(node => node.id));
+  });
+
+  it.each(['single', 'batch'] as const)(
+    'lets the second same-line definition take the original ID through %s baseline write', mode => {
+      const first = { ...fact('one', 'variant.c', 'feature', 1, 1), endColumn: 18 };
+      const second = { ...fact('one', 'variant.c', 'feature', 1, 1), startColumn: 18, endColumn: 38 };
+      reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [first, second]));
+      const [left, right] = queries.getNodesByFile('variant.c').sort((a, b) => a.startColumn - b.startColumn);
+      const aCaller = baseline('caller.c', 'aCaller', 20, 22);
+      const bCaller = baseline('caller.c', 'bCaller', 24, 26);
+      const target = baseline('target.c', 'target', 30, 33);
+      queries.insertNodes([aCaller, bCaller, target]);
+      queries.insertEdge({ source: aCaller.id, target: left!.id, kind: 'references', line: 21,
+        metadata: { refName: 'feature', refKind: 'function_ref' } });
+      queries.insertEdge({ source: bCaller.id, target: right!.id, kind: 'references', line: 25,
+        metadata: { refName: 'feature', refKind: 'function_ref' } });
+      queries.insertEdge({ source: bCaller.id, target: right!.id, kind: 'references', line: 26 });
+      queries.insertEdge({ source: left!.id, target: target.id, kind: 'calls', line: 1, provenance: 'clangd' });
+      queries.insertEdge({ source: left!.id, target: target.id, kind: 'calls', line: 2, provenance: 'heuristic' });
+      queries.insertEdge({ source: right!.id, target: target.id, kind: 'calls', line: 3, provenance: 'heuristic' });
+      const trackedEdge = conn.getDb().prepare('SELECT id FROM edges WHERE source = ? AND line = 1')
+        .get(left!.id) as { id: number };
+      conn.getDb().prepare('INSERT INTO semantic_edge_configs (edge_id,config_id) VALUES (?,?)')
+        .run(trackedEdge.id, 'one');
+      queries.insertUnresolvedRef({ fromNodeId: left!.id, referenceName: 'target',
+        referenceKind: 'calls', line: 1, column: 4, filePath: 'variant.c', language: 'c' });
+
+      const recovered = { ...baseline('variant.c', 'feature', 1, 1), startColumn: 18, endColumn: 38 };
+      if (mode === 'single') queries.insertNode(recovered);
+      else queries.insertNodes([baseline('variant.c', 'other', 4, 5), recovered]);
+      const nodes = queries.getNodesByFile('variant.c').filter(node => node.name === 'feature')
+        .sort((a, b) => a.startColumn - b.startColumn);
+      expect(nodes).toHaveLength(2);
+      expect(nodes[0]).toMatchObject({ semanticOrigin: 'clangd', startColumn: 0 });
+      expect(nodes[0]!.id).not.toBe(left!.id);
+      expect(nodes[1]).toMatchObject({ id: recovered.id, startColumn: 18 });
+      expect(nodes[1]!.semanticOrigin).toBeUndefined();
+      expect(conn.getDb().prepare(`
+        SELECT n.start_column AS col, c.node_id, c.definition_col FROM semantic_node_configs c
+        JOIN nodes n ON n.id = c.node_id ORDER BY n.start_column
+      `).all()).toEqual([
+        { col: 0, node_id: nodes[0]!.id, definition_col: 0 },
+        { col: 18, node_id: recovered.id, definition_col: 18 },
+      ]);
+      expect(conn.getDb().prepare('SELECT source,target,line,provenance FROM edges ORDER BY line').all())
+        .toEqual([
+          { source: nodes[0]!.id, target: target.id, line: 1, provenance: 'clangd' },
+          { source: nodes[0]!.id, target: target.id, line: 2, provenance: 'heuristic' },
+          { source: aCaller.id, target: nodes[0]!.id, line: 21, provenance: null },
+          { source: bCaller.id, target: recovered.id, line: 25, provenance: null },
+        ]);
+      expect(conn.getDb().prepare('SELECT edge_id FROM semantic_edge_configs').all())
+        .toEqual([{ edge_id: trackedEdge.id }]);
+      expect(conn.getDb().prepare('SELECT from_node_id FROM unresolved_refs').all())
+        .toEqual([{ from_node_id: nodes[0]!.id }]);
+      reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [second, first]));
+      expect(queries.getNodesByFile('variant.c').filter(node => node.name === 'feature')
+        .sort((a, b) => a.startColumn - b.startColumn).map(node => node.id))
+        .toEqual([nodes[0]!.id, recovered.id]);
+    }
+  );
+
+  it('rejects an occupied column ID without migrating the old identity', () => {
+    const first = { ...fact('one', 'variant.c', 'feature', 1, 1), endColumn: 18 };
+    const second = { ...fact('one', 'variant.c', 'feature', 1, 1), startColumn: 18, endColumn: 38 };
+    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [first, second]));
+    const occupied = { ...baseline('other.c', 'unrelated', 5, 5),
+      id: semanticCollisionNodeId(first) };
+    queries.insertNode(occupied);
+    const before = conn.getDb().prepare('SELECT id,file_path,start_column,semantic_origin FROM nodes ORDER BY id').all();
+    expect(() => queries.insertNode({ ...baseline('variant.c', 'feature', 1, 1),
+      startColumn: 18, endColumn: 38 })).toThrow(/collides/);
+    expect(conn.getDb().prepare('SELECT id,file_path,start_column,semantic_origin FROM nodes ORDER BY id').all())
+      .toEqual(before);
+    expect(conn.getDb().prepare('SELECT node_id FROM semantic_node_configs ORDER BY node_id').all())
+      .toEqual(queries.getNodesByFile('variant.c').map(node => node.id).sort()
+        .map(node_id => ({ node_id })));
+  });
+
+  it('does not use column disambiguation when an unrelated node occupies the row ID', () => {
+    const observed = fact('one', 'variant.c', 'feature', 1, 1);
+    const occupied = { ...baseline('other.c', 'unrelated', 5, 5),
+      id: generateNodeId('variant.c', 'function', 'feature', 1) };
+    queries.insertNode(occupied);
     expect(() => reconcileCppSemanticNodes(conn.getDb(), queries,
-      collection(['one'], [first, second]))).toThrow(/collides/);
+      collection(['one'], [observed]))).toThrow(/collides/);
     expect(queries.getNodesByFile('variant.c')).toEqual([]);
-    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [
-      fact('one', 'variant.c', 'static_helper', 2, 3),
-      fact('one', 'variant.c', 'static_helper', 8, 9),
-    ]));
-    expect(queries.getNodesByFile('variant.c')).toHaveLength(2);
+    expect(queries.getNodeById(occupied.id)).toMatchObject({ name: 'unrelated', filePath: 'other.c' });
+    expect(conn.getDb().prepare('SELECT * FROM semantic_configs').all()).toEqual([]);
+  });
+
+  it('rolls back ID relocation when the following ordinary write fails', () => {
+    const first = { ...fact('one', 'variant.c', 'feature', 1, 1), endColumn: 18 };
+    const second = { ...fact('one', 'variant.c', 'feature', 1, 1), startColumn: 18, endColumn: 38 };
+    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [first, second]));
+    const before = queries.getNodesByFile('variant.c');
+    conn.getDb().prepare(`
+      CREATE TRIGGER reject_baseline BEFORE INSERT ON nodes
+      WHEN NEW.semantic_origin IS NULL AND NEW.start_column = 18
+      BEGIN SELECT RAISE(ABORT, 'injected baseline failure'); END
+    `).run();
+    const recovered = { ...baseline('variant.c', 'feature', 1, 1), startColumn: 18, endColumn: 38 };
+    expect(() => queries.insertNode(recovered)).toThrow(/injected baseline failure/);
+    expect(queries.getNodesByFile('variant.c')).toEqual(before);
+    expect(conn.getDb().prepare('SELECT node_id FROM semantic_node_configs ORDER BY node_id').all())
+      .toEqual(before.map(node => node.id).sort().map(node_id => ({ node_id })));
   });
 
   it('transfers memberships when later extraction chooses a different baseline ID', () => {
@@ -152,7 +262,7 @@ describe('C/C++ semantic node reconciliation', () => {
     expect(queries.getNodeById(original.id)?.semanticOrigin).toBeUndefined();
   });
 
-  it('rejects a disjoint same-ID ordinary replacement without changing old provenance or edges', () => {
+  it('rejects a forged same-ID ordinary replacement without changing old provenance or edges', () => {
     const observed = { ...fact('one', 'variant.c', 'feature', 2, 2), endColumn: 18 };
     reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [observed]));
     const original = queries.getNodesByFile('variant.c')[0]!;
@@ -160,7 +270,8 @@ describe('C/C++ semantic node reconciliation', () => {
     queries.insertNode(caller);
     queries.insertEdge({ source: caller.id, target: original.id, kind: 'references',
       line: 35, column: 8, metadata: { refName: 'feature', refKind: 'function_ref' } });
-    const unrelated = { ...baseline('variant.c', 'feature', 2, 2), startColumn: 19, endColumn: 38 };
+    const unrelated = { ...baseline('variant.c', 'feature', 3, 3), id: original.id,
+      startColumn: 19, endColumn: 38 };
     expect(unrelated.id).toBe(original.id);
     expect(() => queries.insertNode(unrelated)).toThrow(/semantic node ID/);
     expect(queries.getNodeById(original.id)).toMatchObject({
@@ -175,7 +286,8 @@ describe('C/C++ semantic node reconciliation', () => {
   it('rolls back a batch when one ordinary node conflicts with a disjoint semantic identity', () => {
     const observed = { ...fact('one', 'variant.c', 'feature', 2, 2), endColumn: 18 };
     reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [observed]));
-    const unrelated = { ...baseline('variant.c', 'feature', 2, 2), startColumn: 19, endColumn: 38 };
+    const unrelated = { ...baseline('variant.c', 'feature', 3, 3),
+      id: generateNodeId('variant.c', 'function', 'feature', 2), startColumn: 19, endColumn: 38 };
     expect(() => queries.insertNodes([baseline('variant.c', 'other', 8, 9), unrelated]))
       .toThrow(/semantic node ID/);
     expect(queries.getNodesByFile('variant.c')).toMatchObject([{

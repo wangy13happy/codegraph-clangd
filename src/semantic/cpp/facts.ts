@@ -1,6 +1,7 @@
 /** @file clangd LSP 坐标、源码身份和内存语义事实。 */
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import { isWithinProject } from './compile-database';
 import { LspCallHierarchyItem, LspDocumentSymbol, LspIncomingCall, LspPosition,
@@ -19,6 +20,19 @@ export interface SemanticSymbolIdentity {
 export interface SemanticSymbolFact extends SemanticSymbolIdentity {
   configId: string;
   signature?: string;
+}
+
+/**
+ * @brief 为真正碰撞的同行同名 C/C++ 定义生成稳定的列号消歧 ID。
+ * @param[in] identity 定义的文件、类型、名称和起始行列坐标
+ * @return 与常规行号 ID 不同、同一源码位置跨采集保持不变的节点 ID
+ */
+export function semanticCollisionNodeId(identity: Pick<SemanticSymbolIdentity,
+  'filePath' | 'kind' | 'name' | 'startLine' | 'startColumn'>): string {
+  const hash = createHash('sha256').update(JSON.stringify([
+    identity.filePath, identity.kind, identity.name, identity.startLine, identity.startColumn,
+  ])).digest('hex').slice(0, 32);
+  return `${identity.kind}:${hash}`;
 }
 
 /**

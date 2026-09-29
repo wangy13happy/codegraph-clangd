@@ -5,7 +5,8 @@ import { QueryBuilder } from '../../db/queries';
 import { generateNodeId } from '../../extraction/tree-sitter-helpers';
 import { Node } from '../../types';
 import { SemanticFactCollection } from './index';
-import { SemanticSymbolFact, semanticRangesOverlap, assertPairwiseSemanticOverlap } from './facts';
+import { SemanticSymbolFact, semanticRangesOverlap, assertPairwiseSemanticOverlap,
+  semanticCollisionNodeId } from './facts';
 
 /**
  * @brief 拒绝未能安全映射到图节点的事实，避免部分 SQL 更新后被当作完整清单提交。
@@ -114,14 +115,23 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
       assertPairwiseSemanticOverlap(candidates);
       let winner = candidates[0];
       if (!winner) {
-        winner = { id: generateNodeId(fact.filePath, fact.kind, fact.name, fact.startLine),
+        let id = generateNodeId(fact.filePath, fact.kind, fact.name, fact.startLine);
+        const occupant = queries.getNodeById(id);
+        if (occupant) {
+          if (occupant.filePath !== fact.filePath || occupant.kind !== fact.kind ||
+              occupant.name !== fact.name || occupant.startLine !== fact.startLine) {
+            throw new Error('Semantic node ID collides with existing identity');
+          }
+          // 仅真实行号 ID 碰撞时消歧；列号目标也被别的身份占用则拒写并回滚。
+          id = semanticCollisionNodeId(fact);
+          if (queries.getNodeById(id)) throw new Error('Semantic node ID collides with existing identity');
+        }
+        winner = { id,
           kind: fact.kind, name: fact.name, qualifiedName: fact.name,
           filePath: fact.filePath, language: /\.(?:c|h|i)$/i.test(fact.filePath) ? 'c' : 'cpp',
           startLine: fact.startLine, startColumn: fact.startColumn,
           endLine: fact.endLine, endColumn: fact.endColumn,
           signature: fact.signature, semanticOrigin: 'clangd', updatedAt: now };
-        // 冲突 ID 不能覆盖一条不重叠的现有身份，即使 hash 意外相同。
-        if (queries.getNodeById(winner.id)) throw new Error('Semantic node ID collides with existing identity');
         queries.insertNode(winner);
         used.nodesAdded++;
       } else {

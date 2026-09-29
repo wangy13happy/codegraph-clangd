@@ -22,7 +22,9 @@ import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-u
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
-import { semanticRangesOverlap, assertPairwiseSemanticOverlap } from '../semantic/cpp/facts';
+import { semanticRangesOverlap, assertPairwiseSemanticOverlap,
+  semanticCollisionNodeId } from '../semantic/cpp/facts';
+import { generateNodeId } from '../extraction/tree-sitter-helpers';
 
 /**
  * Files that should not be candidates for "dominant file" detection: test/spec
@@ -381,12 +383,42 @@ export class QueryBuilder {
         (node.kind !== 'function' && node.kind !== 'method')) return;
     const existing = this.db.prepare('SELECT * FROM nodes WHERE id = ? AND semantic_origin = ?')
       .get(node.id, 'clangd') as NodeRow | undefined;
-    if (existing && (existing.file_path !== node.filePath || existing.kind !== node.kind ||
-        existing.name !== node.name || !semanticRangesOverlap(node, {
+    if (existing) {
+      if (existing.file_path !== node.filePath || existing.kind !== node.kind ||
+          existing.name !== node.name) {
+        throw new Error('Ordinary node conflicts with existing semantic node ID');
+      }
+      if (semanticRangesOverlap(node, {
           startLine: existing.start_line, startColumn: existing.start_column,
           endLine: existing.end_line, endColumn: existing.end_column,
-        }))) {
-      throw new Error('Ordinary node conflicts with existing semantic node ID');
+        })) return;
+      if (existing.start_line !== node.startLine ||
+          node.id !== generateNodeId(node.filePath, node.kind, node.name, node.startLine)) {
+        throw new Error('Ordinary node conflicts with existing semantic node ID');
+      }
+      const relocated = semanticCollisionNodeId({ filePath: node.filePath, kind: node.kind,
+        name: node.name, startLine: existing.start_line, startColumn: existing.start_column });
+      // 外键无 ON UPDATE CASCADE：先复制旧节点，转移所有子关系，再删除原 ID。
+      if (this.db.prepare('SELECT 1 FROM nodes WHERE id = ?').get(relocated)) {
+        throw new Error('Semantic node ID collides with existing identity');
+      }
+      this.db.prepare(`
+        INSERT INTO nodes (id,kind,name,qualified_name,file_path,language,start_line,end_line,
+          start_column,end_column,docstring,signature,visibility,is_exported,is_async,is_static,
+          is_abstract,decorators,type_parameters,return_type,semantic_origin,updated_at)
+        SELECT ?,kind,name,qualified_name,file_path,language,start_line,end_line,
+          start_column,end_column,docstring,signature,visibility,is_exported,is_async,is_static,
+          is_abstract,decorators,type_parameters,return_type,semantic_origin,updated_at
+        FROM nodes WHERE id = ?
+      `).run(relocated, node.id);
+      this.db.prepare('UPDATE semantic_node_configs SET node_id = ? WHERE node_id = ?')
+        .run(relocated, node.id);
+      this.db.prepare('UPDATE unresolved_refs SET from_node_id = ? WHERE from_node_id = ?')
+        .run(relocated, node.id);
+      this.db.prepare('UPDATE edges SET source = ? WHERE source = ?').run(relocated, node.id);
+      this.db.prepare('UPDATE edges SET target = ? WHERE target = ?').run(relocated, node.id);
+      this.deleteNode(node.id);
+      this.nodeCache.delete(relocated);
     }
   }
 
