@@ -21,6 +21,25 @@ export interface SemanticSymbolFact extends SemanticSymbolIdentity {
   signature?: string;
 }
 
+/**
+ * @brief 判断同名同文件定义的源码范围是否足以表示同一个函数体。
+ * @param[in] left 第一份定义的行列范围
+ * @param[in] right 第二份定义的行列范围
+ * @return 共享结束行或存在至少半个短范围的交叠时返回 true
+ */
+export function semanticRangesOverlap(left: Pick<SemanticSymbolIdentity, 'startLine' | 'endLine' | 'startColumn' | 'endColumn'>,
+  right: Pick<SemanticSymbolIdentity, 'startLine' | 'endLine' | 'startColumn' | 'endColumn'>): boolean {
+  const start = Math.max(left.startLine, right.startLine);
+  const end = Math.min(left.endLine, right.endLine);
+  if (start > end) return false;
+  // 同一物理行里连续的两个函数可有相同 end/start 行，但不共享源码字节。
+  if (left.endLine === right.startLine && left.endColumn <= right.startColumn ||
+      right.endLine === left.startLine && right.endColumn <= left.startColumn) return false;
+  const sharedLines = end - start + 1;
+  const shorter = Math.min(left.endLine - left.startLine + 1, right.endLine - right.startLine + 1);
+  return left.endLine === right.endLine || sharedLines * 2 >= shorter;
+}
+
 export interface SemanticCallFact {
   configId: string;
   caller: SemanticSymbolIdentity;

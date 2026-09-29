@@ -2,6 +2,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { pathToFileURL } from 'url';
+import { createHash } from 'crypto';
 import { CppSemanticRuntimeOptions } from '../../project-config';
 import { CompilationDatabase } from './compile-database';
 import { ClangdClient } from './clangd-client';
@@ -17,6 +18,10 @@ export type { SemanticCallFact, SemanticSymbolFact, SemanticSymbolIdentity } fro
 export interface SemanticViewResult {
   id: string;
   key: string;
+  /** 实际编译条目中语义参数集合的稳定哈希，不等于 CMake target 的 key。 */
+  flagsHash: string;
+  /** 仅整个视图使用同一 compiler 时提供；多编译器视图不猜测代表值。 */
+  compiler?: string;
   inventory: 'authoritative' | 'advisory';
   grouping: 'cmake-target' | 'semantic-flags';
   success: boolean;
@@ -132,7 +137,13 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
     }
   }
   for (const file of files) if (!covered.includes(file)) failed.add(file);
-  return { status: { id: view.id, key: view.key, inventory: view.inventory, grouping: view.grouping,
+  // 同一视图可含多 TU/重复命令；参数按原次序表达语义，集合去重再排序避免枚举次序影响哈希。
+  const flagSets = [...new Set(view.entries.map(entry => JSON.stringify(entry.semanticFlags)))].sort();
+  const flagsHash = createHash('sha256').update(JSON.stringify(flagSets)).digest('hex');
+  const compilers = new Set(view.entries.map(entry => entry.compiler));
+  const compiler = compilers.size === 1 ? [...compilers][0] : undefined;
+  return { status: { id: view.id, key: view.key, flagsHash, ...(compiler ? { compiler } : {}),
+    inventory: view.inventory, grouping: view.grouping,
     success: failed.size === 0 && !error && !signal?.aborted,
     coveredFiles: covered, failedFiles: [...failed].sort(), analyzedTuCount: covered.length,
     failedTuCount: failed.size, durationMs: Date.now() - started, ...(error ? { error } : {}) }, symbols, calls };

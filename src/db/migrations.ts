@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 9;
+export const CURRENT_SCHEMA_VERSION = 10;
 
 /**
  * Migration definition
@@ -175,6 +175,39 @@ const migrations: Migration[] = [
       db.exec(
         'CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1'
       );
+    },
+  },
+  {
+    version: 10,
+    description: 'Persist C/C++ semantic configuration membership and repair-created node origin',
+    up: (db) => {
+      // 新建库的 schema 已有此列；旧库升级及版本记录落后时重放均不能覆盖旧图。
+      const cols = db.prepare('PRAGMA table_info(nodes)').all() as Array<{ name: string }>;
+      if (!cols.some((col) => col.name === 'semantic_origin')) {
+        db.exec('ALTER TABLE nodes ADD COLUMN semantic_origin TEXT DEFAULT NULL');
+      }
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS semantic_configs (
+          id TEXT PRIMARY KEY, label TEXT NOT NULL, compiler TEXT,
+          flags_hash TEXT NOT NULL, authority TEXT NOT NULL,
+          metadata TEXT, updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS semantic_node_configs (
+          node_id TEXT NOT NULL, config_id TEXT NOT NULL,
+          signature TEXT, definition_line INTEGER, definition_col INTEGER,
+          PRIMARY KEY (node_id, config_id),
+          FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+          FOREIGN KEY (config_id) REFERENCES semantic_configs(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS semantic_edge_configs (
+          edge_id INTEGER NOT NULL, config_id TEXT NOT NULL,
+          PRIMARY KEY (edge_id, config_id),
+          FOREIGN KEY (edge_id) REFERENCES edges(id) ON DELETE CASCADE,
+          FOREIGN KEY (config_id) REFERENCES semantic_configs(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_semantic_node_configs_config ON semantic_node_configs(config_id);
+        CREATE INDEX IF NOT EXISTS idx_semantic_edge_configs_config ON semantic_edge_configs(config_id);
+      `);
     },
   },
 ];

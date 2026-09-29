@@ -131,6 +131,8 @@ describe('generated flag — schema migration to v9', () => {
     conn.exec(`
       CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL, description TEXT);
       INSERT INTO schema_versions VALUES (8, 0, 'legacy');
+      -- v10 也迁移 nodes；真实 v8 数据库始终具有这张核心表。
+      CREATE TABLE nodes (id TEXT PRIMARY KEY);
       CREATE TABLE files (
         path TEXT PRIMARY KEY,
         content_hash TEXT NOT NULL,

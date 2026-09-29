@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { loadCompilationDatabase } from '../src/semantic/cpp/compile-database';
 import { ClangdClient } from '../src/semantic/cpp/clangd-client';
 import { buildCompileViews, collectCppSemanticFacts, materializeCompileView, projectFileFromUri } from '../src/semantic/cpp';
@@ -66,6 +67,12 @@ describe('C/C++ semantic fact collector', () => {
 
     const result = await collectCppSemanticFacts(root, db, { clangdPath: executable, queryDrivers: [] });
     expect(result.views.map(v => v.success)).toEqual([true, true]);
+    for (const [index, view] of views.entries()) {
+      const flags = [...new Set(view.entries.map(entry => JSON.stringify(entry.semanticFlags)))].sort();
+      expect(result.views[index]!.flagsHash).toBe(createHash('sha256').update(JSON.stringify(flags)).digest('hex'));
+      expect(result.views[index]!.compiler).toBe('nonexistent-cross-gcc');
+    }
+    expect(result.views[0]!.flagsHash).not.toBe(result.views[1]!.flagsHash);
     expect(result.views.map(v => v.analyzedTuCount)).toEqual([2, 2]);
     expect(result.symbols.filter(s => s.name === 'feature').map(s => s.signature).sort())
       .toEqual(['int feature(int value)', 'int feature(void)']);

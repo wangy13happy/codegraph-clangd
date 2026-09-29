@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     decorators TEXT, -- JSON array
     type_parameters TEXT, -- JSON array
     return_type TEXT, -- normalized return/result type name (e.g. C++ method return, for receiver-type inference)
+    semantic_origin TEXT DEFAULT NULL, -- 仅语义修复创建的 canonical 身份记录 clangd
     updated_at INTEGER NOT NULL
 );
 
@@ -198,6 +199,38 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_from_name ON unresolved_refs(from_node
 CREATE INDEX IF NOT EXISTS idx_unresolved_status ON unresolved_refs(status);
 CREATE INDEX IF NOT EXISTS idx_unresolved_failed_tail ON unresolved_refs(name_tail) WHERE status = 'failed';
 CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
+
+-- 编译配置归属放在旁表，普通节点和边查询不增加 JOIN。
+CREATE TABLE IF NOT EXISTS semantic_configs (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    compiler TEXT,
+    flags_hash TEXT NOT NULL,
+    authority TEXT NOT NULL,
+    metadata TEXT,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS semantic_node_configs (
+    node_id TEXT NOT NULL,
+    config_id TEXT NOT NULL,
+    signature TEXT,
+    definition_line INTEGER,
+    definition_col INTEGER,
+    PRIMARY KEY (node_id, config_id),
+    FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (config_id) REFERENCES semantic_configs(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS semantic_edge_configs (
+    edge_id INTEGER NOT NULL,
+    config_id TEXT NOT NULL,
+    PRIMARY KEY (edge_id, config_id),
+    FOREIGN KEY (edge_id) REFERENCES edges(id) ON DELETE CASCADE,
+    FOREIGN KEY (config_id) REFERENCES semantic_configs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_node_configs_config ON semantic_node_configs(config_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_edge_configs_config ON semantic_edge_configs(config_id);
 
 -- Project metadata for version/provenance tracking
 CREATE TABLE IF NOT EXISTS project_metadata (

@@ -166,6 +166,9 @@ export interface Node {
   /** Function/method signature */
   signature?: string;
 
+  /** Present only when semantic repair created this canonical node identity. */
+  semanticOrigin?: 'clangd';
+
   /** Visibility modifier */
   visibility?: 'public' | 'private' | 'protected' | 'internal';
 
@@ -223,7 +226,7 @@ export interface Edge {
   column?: number;
 
   /** How this edge was created */
-  provenance?: 'tree-sitter' | 'scip' | 'heuristic';
+  provenance?: 'tree-sitter' | 'scip' | 'heuristic' | 'clangd';
 }
 
 /**

@@ -22,6 +22,7 @@ import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-u
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
+import { semanticRangesOverlap } from '../semantic/cpp/facts';
 
 /**
  * Files that should not be candidates for "dominant file" detection: test/spec
@@ -96,6 +97,7 @@ interface NodeRow {
   decorators: string | null;
   type_parameters: string | null;
   return_type: string | null;
+  semantic_origin: string | null;
   updated_at: number;
 }
 
@@ -177,6 +179,7 @@ function rowToNode(row: NodeRow): Node {
     decorators: row.decorators ? safeJsonParse(row.decorators, undefined) : undefined,
     typeParameters: row.type_parameters ? safeJsonParse(row.type_parameters, undefined) : undefined,
     returnType: row.return_type ?? undefined,
+    semanticOrigin: row.semantic_origin as Node['semanticOrigin'] ?? undefined,
     updatedAt: row.updated_at,
   };
 }
@@ -290,7 +293,7 @@ export class QueryBuilder {
    * Run `rows` through a multi-row `INSERT` built as `head + (tuple,)*n`,
    * decomposed greedily into the cached batch sizes. Preserves row order.
    */
-  private runBatched(kind: string, head: string, tuple: string, rows: unknown[][]): void {
+  private runBatched(kind: string, head: string, tuple: string, rows: unknown[][], tail = ''): void {
     if (rows.length === 0) return;
     let i = 0;
     for (const size of QueryBuilder.BATCH_SIZES) {
@@ -298,7 +301,7 @@ export class QueryBuilder {
         const key = `${kind}:${size}`;
         let stmt = this.batchStmts.get(key);
         if (!stmt) {
-          stmt = this.db.prepare(head + new Array(size).fill(tuple).join(','));
+          stmt = this.db.prepare(head + new Array(size).fill(tuple).join(',') + tail);
           this.batchStmts.set(key, stmt);
         }
         if (size === 1) {
@@ -369,24 +372,64 @@ export class QueryBuilder {
   // ===========================================================================
 
   /**
+   * @brief 普通 C/C++ 提取写入前，把重叠的 clangd 独占身份归属转到基线 ID。
+   * @param[in] node 即将写入的普通提取节点
+   * @return 无；由调用者事务保证迁移与实际节点写入一起提交或回滚
+   */
+  private takeOverSemanticNodes(node: Node): void {
+    if (node.semanticOrigin || (node.language !== 'c' && node.language !== 'cpp') ||
+        (node.kind !== 'function' && node.kind !== 'method')) return;
+    const candidates = this.db.prepare(`
+      SELECT * FROM nodes WHERE file_path = ? AND kind = ? AND name = ?
+        AND semantic_origin = 'clangd' AND start_line <= ? AND end_line >= ?
+      ORDER BY start_line, id
+    `).all(node.filePath, node.kind, node.name, node.endLine, node.startLine) as NodeRow[];
+    for (const row of candidates) {
+      if (row.id === node.id || !semanticRangesOverlap(node, {
+        startLine: row.start_line, startColumn: row.start_column,
+        endLine: row.end_line, endColumn: row.end_column,
+      })) continue;
+      // 即使行号派生 ID 不同也由基线接管；外键级联清除旧身份的悬挂边和引用，
+      // PR4 收集直接调用事实后重建正确的调用边，不盲目移植旧边。
+      this.db.prepare(`
+        INSERT INTO semantic_node_configs (node_id, config_id, signature, definition_line, definition_col)
+        SELECT ?, config_id, signature, definition_line, definition_col
+        FROM semantic_node_configs WHERE node_id = ?
+        ON CONFLICT(node_id, config_id) DO NOTHING
+      `).run(node.id, row.id);
+      this.deleteNode(row.id);
+    }
+  }
+
+  /**
    * Insert a new node
    */
   insertNode(node: Node): void {
     if (!this.stmts.insertNode) {
       this.stmts.insertNode = this.db.prepare(`
-        INSERT OR REPLACE INTO nodes (
+        INSERT INTO nodes (
           id, kind, name, qualified_name, file_path, language,
           start_line, end_line, start_column, end_column,
           docstring, signature, visibility,
           is_exported, is_async, is_static, is_abstract,
-          decorators, type_parameters, return_type, updated_at
+          decorators, type_parameters, return_type, semantic_origin, updated_at
         ) VALUES (
           @id, @kind, @name, @qualifiedName, @filePath, @language,
           @startLine, @endLine, @startColumn, @endColumn,
           @docstring, @signature, @visibility,
           @isExported, @isAsync, @isStatic, @isAbstract,
-          @decorators, @typeParameters, @returnType, @updatedAt
-        )
+          @decorators, @typeParameters, @returnType, @semanticOrigin, @updatedAt
+        ) ON CONFLICT(id) DO UPDATE SET
+          kind=excluded.kind, name=excluded.name, qualified_name=excluded.qualified_name,
+          file_path=excluded.file_path, language=excluded.language,
+          start_line=excluded.start_line, end_line=excluded.end_line,
+          start_column=excluded.start_column, end_column=excluded.end_column,
+          docstring=excluded.docstring, signature=excluded.signature,
+          visibility=excluded.visibility, is_exported=excluded.is_exported,
+          is_async=excluded.is_async, is_static=excluded.is_static,
+          is_abstract=excluded.is_abstract, decorators=excluded.decorators,
+          type_parameters=excluded.type_parameters, return_type=excluded.return_type,
+          semantic_origin=excluded.semantic_origin, updated_at=excluded.updated_at
       `);
     }
 
@@ -402,48 +445,39 @@ export class QueryBuilder {
       return;
     }
 
-    // INSERT OR REPLACE may overwrite a node we have cached. Drop the
-    // stale entry so the next getNodeById sees the new row, not the old
-    // one (matches the cache-invalidation pattern used by updateNode and
-    // deleteNode below).
+    // UPSERT 可覆盖缓存中已有的同 ID 节点；读取前使缓存失效。
     this.nodeCache.delete(node.id);
 
-    this.stmts.insertNode.run({
-      id: node.id,
-      kind: node.kind,
-      name: node.name,
-      qualifiedName: node.qualifiedName ?? node.name,
-      filePath: node.filePath,
-      language: node.language,
-      startLine: node.startLine ?? 0,
-      endLine: node.endLine ?? 0,
-      startColumn: node.startColumn ?? 0,
-      endColumn: node.endColumn ?? 0,
-      docstring: node.docstring ?? null,
-      signature: node.signature ?? null,
-      visibility: node.visibility ?? null,
-      isExported: node.isExported ? 1 : 0,
-      isAsync: node.isAsync ? 1 : 0,
-      isStatic: node.isStatic ? 1 : 0,
-      isAbstract: node.isAbstract ? 1 : 0,
-      decorators: node.decorators ? JSON.stringify(node.decorators) : null,
-      typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
-      returnType: node.returnType ?? null,
-      updatedAt: node.updatedAt ?? Date.now(),
-    });
+    this.db.transaction(() => {
+      this.stmts.insertNode!.run({
+        id: node.id,
+        kind: node.kind,
+        name: node.name,
+        qualifiedName: node.qualifiedName ?? node.name,
+        filePath: node.filePath,
+        language: node.language,
+        startLine: node.startLine ?? 0,
+        endLine: node.endLine ?? 0,
+        startColumn: node.startColumn ?? 0,
+        endColumn: node.endColumn ?? 0,
+        docstring: node.docstring ?? null,
+        signature: node.signature ?? null,
+        visibility: node.visibility ?? null,
+        isExported: node.isExported ? 1 : 0,
+        isAsync: node.isAsync ? 1 : 0,
+        isStatic: node.isStatic ? 1 : 0,
+        isAbstract: node.isAbstract ? 1 : 0,
+        decorators: node.decorators ? JSON.stringify(node.decorators) : null,
+        typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
+        returnType: node.returnType ?? null,
+        semanticOrigin: node.semanticOrigin ?? null,
+        updatedAt: node.updatedAt ?? Date.now(),
+      });
+      this.takeOverSemanticNodes(node);
 
-    // Segment vocabulary rides the same write path (and transaction) so it can
-    // never drift ahead of the nodes it describes. Deletes intentionally leave
-    // orphans behind — vocab rows are proposals re-verified against nodes
-    // before use, and a full index clears the table at its start. File nodes
-    // are excluded: a file's basename duplicates the symbols inside it
-    // (state-machine.ts / OrderStateMachine), which double-counts every
-    // concept and defeats the singleton-vs-cluster rarity statistics. Import
-    // nodes are excluded too (#1144): they're named after module specifiers
-    // ("external-unindexed-pkg", "./utils/helpers"), not symbols — an
-    // import-only name can never be surfaced (getSegmentMatches requires a
-    // real definition), so its rows would only inflate the rarity statistics.
-    if (this.isSegmentableKind(node.kind)) this.insertNameSegments(node.name);
+      // 名字词段同事务落库；孤立词段留作待核验候选，file/import 节点不计入该索引。
+      if (this.isSegmentableKind(node.kind)) this.insertNameSegments(node.name);
+    })();
   }
 
   /** Which node kinds contribute their name to the segment vocabulary — the
@@ -508,21 +542,33 @@ export class QueryBuilder {
           node.decorators ? JSON.stringify(node.decorators) : null,
           node.typeParameters ? JSON.stringify(node.typeParameters) : null,
           node.returnType ?? null,
+          node.semanticOrigin ?? null,
           node.updatedAt ?? Date.now(),
         ]);
         if (this.isSegmentableKind(node.kind)) this.collectNameSegmentRows(node.name, segmentRows);
       }
       this.runBatched(
         'insertNodes',
-        `INSERT OR REPLACE INTO nodes (
+        `INSERT INTO nodes (
           id, kind, name, qualified_name, file_path, language,
           start_line, end_line, start_column, end_column,
           docstring, signature, visibility,
           is_exported, is_async, is_static, is_abstract,
-          decorators, type_parameters, return_type, updated_at
+          decorators, type_parameters, return_type, semantic_origin, updated_at
         ) VALUES `,
-        '(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-        rows
+        '(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        rows,
+        ` ON CONFLICT(id) DO UPDATE SET
+          kind=excluded.kind, name=excluded.name, qualified_name=excluded.qualified_name,
+          file_path=excluded.file_path, language=excluded.language,
+          start_line=excluded.start_line, end_line=excluded.end_line,
+          start_column=excluded.start_column, end_column=excluded.end_column,
+          docstring=excluded.docstring, signature=excluded.signature,
+          visibility=excluded.visibility, is_exported=excluded.is_exported,
+          is_async=excluded.is_async, is_static=excluded.is_static,
+          is_abstract=excluded.is_abstract, decorators=excluded.decorators,
+          type_parameters=excluded.type_parameters, return_type=excluded.return_type,
+          semantic_origin=excluded.semantic_origin, updated_at=excluded.updated_at`
       );
       this.runBatched(
         'insertNameSegments',
@@ -530,6 +576,10 @@ export class QueryBuilder {
         '(?,?)',
         segmentRows
       );
+      // 基线行必须先存在：迁移 membership 时立即检查目标外键。
+      for (const node of nodes) if (node.id && node.kind && node.name && node.filePath && node.language) {
+        this.takeOverSemanticNodes(node);
+      }
     })();
   }
 
