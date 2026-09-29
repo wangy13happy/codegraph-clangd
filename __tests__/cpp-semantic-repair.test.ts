@@ -686,16 +686,27 @@ describe('C/C++ semantic node reconciliation', () => {
     queries.insertEdge({ source: caller.id, target: wrong.id, kind: 'calls', line: 16, column: 4 });
     queries.insertEdge({ source: caller.id, target: wrong.id, kind: 'calls', line: 17,
       column: 0, provenance: 'heuristic' });
-    const input = collection(['one'], [fact('one', 'caller.c', 'caller', 10, 30),
+    const input = collection(['one', 'wrong-view'], [fact('one', 'caller.c', 'caller', 10, 30),
       fact('one', 'right.c', 'helper', 2, 7)]);
     input.views[0]!.coveredFiles = ['caller.c', 'right.c'];
     input.views[0]!.analyzedTuCount = 2;
+    input.views[1]!.coveredFiles = [];
+    input.views[1]!.failedFiles = ['wrong.c'];
+    input.views[1]!.failedTuCount = 1;
+    input.views[1]!.analyzedTuCount = 0;
+    input.views[1]!.success = false;
     input.calls = [{ configId: 'one', caller: fact('one', 'caller.c', 'caller', 10, 30),
       callee: fact('one', 'right.c', 'helper', 2, 7), callLine: 16, callColumn: 4 }];
     reconcileCppSemanticNodes(conn.getDb(), queries, input);
     const partial = { ...input, inventory: 'advisory' as const };
     expect(queries.reconcileCppSemanticCalls(partial)).toEqual({ added: 1, removed: 0 });
     expect(queries.getOutgoingEdges(caller.id, ['calls'])).toHaveLength(3);
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 0, removed: 0 });
+    input.views[1]!.success = true;
+    input.views[1]!.failedFiles = [];
+    input.views[1]!.failedTuCount = 0;
+    input.views[1]!.coveredFiles = ['wrong.c'];
+    input.views[1]!.analyzedTuCount = 1;
     expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 0, removed: 1 });
     expect(queries.getOutgoingEdges(caller.id, ['calls'])).toMatchObject([
       { target: wrong.id, provenance: 'heuristic' },
@@ -720,6 +731,72 @@ describe('C/C++ semantic node reconciliation', () => {
     input.views[0]!.failedFiles = [];
     expect(queries.reconcileCppSemanticCalls(input).removed).toBe(1);
     expect(queries.getOutgoingEdges(caller.id, ['calls'])).toEqual([]);
+  });
+
+  it('keeps an old call when a callee-only view has symbols but its incoming hierarchy failed', () => {
+    const caller = baseline('caller.c', 'caller', 10, 30);
+    const target = baseline('callee.c', 'callee', 2, 8);
+    const observed = baseline('other.c', 'observed', 2, 8);
+    queries.insertNodes([caller, target, observed]);
+    queries.insertEdge({ source: caller.id, target: target.id, kind: 'calls', line: 16, column: 4,
+      provenance: 'tree-sitter', metadata: { refName: 'callee' } });
+    const input = collection(['caller-view', 'callee-view'], [
+      fact('caller-view', 'caller.c', 'caller', 10, 30),
+      fact('caller-view', 'other.c', 'observed', 2, 8),
+      fact('callee-view', 'callee.c', 'callee', 2, 8),
+    ]);
+    input.views[0]!.coveredFiles = ['caller.c', 'other.c'];
+    input.views[0]!.analyzedTuCount = 2;
+    input.views[1]!.coveredFiles = [];
+    input.views[1]!.failedFiles = ['callee.c'];
+    input.views[1]!.failedTuCount = 1;
+    input.views[1]!.analyzedTuCount = 0;
+    input.views[1]!.success = false;
+    input.calls = [{ configId: 'caller-view', caller: fact('caller-view', 'caller.c', 'caller', 10, 30),
+      callee: fact('caller-view', 'other.c', 'observed', 2, 8), callLine: 18, callColumn: 3 }];
+    reconcileCppSemanticNodes(conn.getDb(), queries, input);
+    const original = conn.getDb().prepare('SELECT id FROM edges WHERE target = ?').get(target.id) as { id: number };
+    conn.getDb().prepare('INSERT INTO semantic_edge_configs (edge_id,config_id) VALUES (?,?)')
+      .run(original.id, 'callee-view');
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 1, removed: 0 });
+    expect(queries.getOutgoingEdges(caller.id, ['calls']))
+      .toMatchObject([{ target: target.id, line: 16 }, { target: observed.id, line: 18 }]);
+    expect(conn.getDb().prepare('SELECT edge_id,config_id FROM semantic_edge_configs WHERE edge_id = ?').all(original.id))
+      .toEqual([{ edge_id: original.id, config_id: 'callee-view' }]);
+    // 被调视图成功但不与 caller 的配置相交，仍不能用其零 incoming 推断 caller-view 的边不存在。
+    input.views[1]!.success = true;
+    input.views[1]!.failedFiles = [];
+    input.views[1]!.failedTuCount = 0;
+    input.views[1]!.coveredFiles = ['callee.c'];
+    input.views[1]!.analyzedTuCount = 1;
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 0, removed: 0 });
+    expect(conn.getDb().prepare('SELECT id FROM edges WHERE target = ?').get(target.id)).toEqual(original);
+    expect(queries.getOutgoingEdges(caller.id, ['calls']).find(edge => edge.target === target.id))
+      .toMatchObject({ provenance: 'tree-sitter', metadata: { refName: 'callee' } });
+  });
+
+  it('does not let an unrelated failed view block an otherwise complete call-site correction', () => {
+    const caller = baseline('caller.c', 'caller', 10, 30);
+    const target = baseline('callee.c', 'callee', 2, 8);
+    queries.insertNodes([caller, target]);
+    queries.insertEdge({ source: caller.id, target: target.id, kind: 'calls', line: 16, column: 0 });
+    const input = collection(['complete', 'unrelated'], [
+      fact('complete', 'caller.c', 'caller', 10, 30),
+      fact('complete', 'callee.c', 'callee', 2, 8),
+    ]);
+    input.views[0]!.coveredFiles = ['caller.c', 'callee.c'];
+    input.views[0]!.analyzedTuCount = 2;
+    input.views[1]!.coveredFiles = [];
+    input.views[1]!.failedFiles = ['unrelated.c'];
+    input.views[1]!.failedTuCount = 1;
+    input.views[1]!.analyzedTuCount = 0;
+    input.views[1]!.success = false;
+    input.calls = [{ configId: 'complete', caller: fact('complete', 'caller.c', 'caller', 10, 30),
+      callee: fact('complete', 'callee.c', 'callee', 2, 8), callLine: 16, callColumn: 6 }];
+    reconcileCppSemanticNodes(conn.getDb(), queries, input);
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 1, removed: 1 });
+    expect(queries.getOutgoingEdges(caller.id, ['calls']))
+      .toMatchObject([{ target: target.id, line: 16, column: 6, provenance: 'clangd' }]);
   });
 
   it('never overwrites an exact heuristic call when its identity matches semantic evidence', () => {

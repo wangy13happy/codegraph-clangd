@@ -583,16 +583,19 @@ export class QueryBuilder {
     const represented = new Set<string>();
     const representedSources = new Set<string>();
     const representedTargets = new Set<string>();
+    const targetNodes = new Map<string, Node>();
     for (const symbol of collection.symbols) {
       const node = match(symbol);
       if (node && viewIds.has(symbol.configId)) {
         represented.add(`${symbol.configId}\0${node.id}`);
         representedSources.add(node.id);
         representedTargets.add(node.id);
+        targetNodes.set(node.id, node);
       }
     }
     const observed = new Map<string, { source: Node; target: Node; line: number; col: number; configs: Set<string> }>();
     const eligibleNames = new Map<string, Set<string>>();
+    const eligibleTargets = new Map<string, Set<Node>>();
     for (const call of collection.calls) {
       const source = match(call.caller);
       const target = match(call.callee);
@@ -608,6 +611,10 @@ export class QueryBuilder {
         let names = eligibleNames.get(source.id);
         if (!names) { names = new Set(); eligibleNames.set(source.id, names); }
         names.add(target.name);
+        const replacementKey = `${source.id}\0${target.name}`;
+        let targets = eligibleTargets.get(replacementKey);
+        if (!targets) { targets = new Set(); eligibleTargets.set(replacementKey, targets); }
+        targets.add(target);
       }
     }
     /**
@@ -622,6 +629,16 @@ export class QueryBuilder {
         view.failedTuCount === 0 && view.coveredFiles.includes(file) &&
         view.coveredFiles.length === view.analyzedTuCount);
     };
+    /**
+     * @brief 限定调用者和被调者在同一权威、完整的配置里均有源码身份。
+     * @param[in] source 调用者的图节点
+     * @param[in] target 被调者的图节点
+     * @return 两端均完整覆盖并共享已采集配置时为 true
+     */
+    const fullyObservedRelation = (source: Node, target: Node): boolean =>
+      covered(source.filePath) && covered(target.filePath) && collection.views.some(view =>
+        view.coveredFiles.includes(source.filePath) && view.coveredFiles.includes(target.filePath) &&
+        represented.has(`${view.id}\0${source.id}`) && represented.has(`${view.id}\0${target.id}`));
     const result = { added: 0, removed: 0 };
     this.db.transaction(() => {
       const select = this.db.prepare('SELECT id,provenance FROM edges WHERE source = ? AND target = ? AND kind = ? AND line = ? AND col = ?');
@@ -638,10 +655,13 @@ export class QueryBuilder {
         }
         // 唯一索引可能已被 heuristic 占用；绝不改写其归属或删除它。
         if (row && row.provenance !== 'heuristic') {
-          if (covered(entry.source.filePath)) {
+          if (fullyObservedRelation(entry.source, entry.target)) {
             // 完整覆盖方可撤销已验证边在旧视图里的归属；部分结果只附加正向事实。
             for (const view of collection.views) {
-              if (view.coveredFiles.includes(entry.source.filePath)) retireMember.run(row.id, view.id);
+              if (view.coveredFiles.includes(entry.source.filePath) &&
+                  view.coveredFiles.includes(entry.target.filePath) &&
+                  represented.has(`${view.id}\0${entry.source.id}`) &&
+                  represented.has(`${view.id}\0${entry.target.id}`)) retireMember.run(row.id, view.id);
             }
           }
           for (const config of entry.configs) member.run(row.id, config);
@@ -666,6 +686,18 @@ export class QueryBuilder {
         for (const edge of stale.all(sourceId) as Array<{ id: number; target: string; line: number | null; col: number | null; name: string }>) {
           // 缺失事实只能否定已纳入语义清单的目标；错误 static 目标需有同名正向证据。
           if (!representedTargets.has(edge.target) && !eligibleNames.get(sourceId)?.has(edge.name)) continue;
+          const target = targetNodes.get(edge.target);
+          if (target) {
+            // callee 的符号可先于失败的 incoming hierarchy 入库；跨视图不能用符号充当负面证据。
+            if (!fullyObservedRelation(source, target)) continue;
+          } else {
+            const replacements = eligibleTargets.get(`${sourceId}\0${edge.name}`);
+            const oldTarget = this.getNodeById(edge.target);
+            // 错绑目标若仍有失败视图，或正确目标尚无完整覆盖，均保留旧线索。
+            if (!replacements || (oldTarget && collection.views.some(view =>
+              view.failedFiles.includes(oldTarget.filePath))) ||
+              ![...replacements].some(node => fullyObservedRelation(source, node))) continue;
+          }
           const key = JSON.stringify([sourceId, edge.target, edge.line, edge.col]);
           if (!observed.has(key)) result.removed += remove.run(edge.id).changes;
         }
