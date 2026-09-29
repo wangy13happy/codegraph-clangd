@@ -14,6 +14,7 @@ import { TreeSitterExtractor } from '../src/extraction/tree-sitter';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
 import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
+import type { QueryBuilder } from '../src/db/queries';
 
 beforeAll(async () => {
   await initGrammars();
@@ -65,6 +66,83 @@ it.each([false, true])('stores same-line C++ overloads with independent containm
     cleanupTempDir(directory);
   }
 });
+
+// 每例两次索引 2000+ 定义；WASM fallback 实测超过默认 5 秒，保留有界的集成测试预算。
+it.each([false, true].flatMap(chunked => [
+  { chunked, edit: 'append', keep: [true, true] },
+  { chunked, edit: 'line shift', keep: [true, true] },
+  { chunked, edit: 'ambiguous append', keep: [true, true] },
+  { chunked, edit: 'ambiguous shift', keep: [false, true] },
+  { chunked, edit: 'remove right', keep: [true, false] },
+  { chunked, edit: 'remove left', keep: [false, false] },
+  { chunked, edit: 'equal-width removal', keep: [false, false] },
+  { chunked, edit: 'three-member removal', keep: [false, false] },
+  { chunked, edit: 'change ranges', keep: [false, false] },
+]))('preserves collision-group cross-file identity after $edit (chunked=$chunked)', async ({ chunked, edit, keep }) => {
+  const directory = createTempDir();
+  let graph: CodeGraph | undefined;
+  try {
+    const equalWidth = edit === 'equal-width removal' || edit === 'three-member removal';
+    const left = equalWidth ? 'int feature() { return   1; }' : 'int feature() { return 1; }';
+    const right = equalWidth ? 'int feature(int x){return x;}' : 'int feature(int x) { return x; }';
+    const extra = edit === 'three-member removal' ? ' int feature(short x){return x;}'
+      : edit.startsWith('ambiguous') ? `\n${left}` : '';
+    const filler = chunked ? '\n' + Array.from({ length: 2001 }, (_, i) => `void filler_${i}() {}`).join('\n') : '';
+    const calleePath = path.join(directory, 'variant.cpp');
+    fs.writeFileSync(calleePath, `${left} ${right}${extra}\n${filler}`);
+    fs.writeFileSync(path.join(directory, 'caller.cpp'),
+      'int callerLeft() { return 0; }\nint callerRight() { return 0; }\nint callerUnstamped() { return 0; }\n');
+    graph = CodeGraph.initSync(directory);
+    expect((await graph.indexFiles(['variant.cpp', 'caller.cpp'])).success).toBe(true);
+    const queries = (graph as unknown as { queries: QueryBuilder }).queries;
+    const definitions = graph.getNodesByKind('function').filter(node => node.name === 'feature' && node.startLine === 1)
+      .sort((a, b) => a.startColumn - b.startColumn);
+    expect(definitions).toHaveLength(edit === 'three-member removal' ? 3 : 2);
+    const callers = ['callerLeft', 'callerRight', 'callerUnstamped'].map(name =>
+      graph!.getNodesByKind('function').find(node => node.name === name)!);
+    // 独立注入两份已可信解析的普通边，避免 resolver 的重载启发式掩盖重索引错靶。
+    queries.insertEdges(callers.map((caller, i) => ({
+      source: caller.id, target: definitions[i === 1 ? 1 : 0]!.id, kind: 'references',
+      metadata: i < 2 ? { refName: `api.feature.${i}`, refKind: 'function_ref', trusted: true } : undefined,
+      line: i + 1, column: 5,
+    })));
+    const oldEdges = callers.map(caller => graph!.getOutgoingEdges(caller.id)[0]!);
+    const shifted = edit === 'line shift' || edit === 'ambiguous shift';
+    const updated = shifted ? `\n${left} ${right}${extra}\n${filler}`
+      : edit === 'remove right' ? `${left}\n${filler}`
+      : edit === 'remove left' || edit === 'equal-width removal' ? `${right}\n${filler}`
+      : edit === 'three-member removal' ? `${right}${extra}\n${filler}`
+      : edit === 'change ranges' ? `${left.replace('return 1;', 'return 10000;')} ${right}\n${filler}`
+      : `${left} ${right}${extra}\n\n${filler}`;
+    fs.writeFileSync(calleePath, updated);
+    expect((await graph.indexFiles(['variant.cpp'])).success).toBe(true);
+    const current = graph.getNodesByKind('function').filter(node => node.name === 'feature');
+    if (chunked) expect(graph.getNodesByKind('function').length).toBeGreaterThan(2000);
+    for (let i = 0; i < callers.length; i++) {
+      // 无签名的原生节点无法区分收缩组里的等宽替代者；即使剩余目标看似未动也恢复 ref。
+      const preserved = keep[i === 1 ? 1 : 0] &&
+        (edit !== 'remove right' || !!definitions[i === 1 ? 1 : 0]!.signature);
+      const edges = graph.getOutgoingEdges(callers[i]!.id).filter(edge => edge.kind === 'references');
+      if (preserved) {
+        const old = definitions[i === 1 ? 1 : 0]!;
+        const target = current.find(node => node.startColumn === old.startColumn &&
+          node.startLine === old.startLine + (shifted ? 1 : 0))!;
+        expect(edges).toEqual([{ ...oldEdges[i]!, target: target.id }]);
+      } else {
+        expect(edges).toEqual([]);
+      }
+      // 范围不足或旧成员消失时，必须恢复原限定引用；没有 stamp 的边不能凭 targetName 造 ref。
+      const pending = queries.getUnresolvedReferences().filter(ref => ref.fromNodeId === callers[i]!.id);
+      expect(pending).toEqual(!preserved && i < 2 ? [expect.objectContaining({
+        fromNodeId: callers[i]!.id, referenceName: `api.feature.${i}`, referenceKind: 'function_ref',
+        filePath: 'caller.cpp', language: 'cpp', line: i + 1, column: 5,
+      })] : []);
+    }
+  } finally {
+    graph?.close();
+    cleanupTempDir(directory);
+  }
+}, 20000);
 
 // Create a temporary directory for each test
 function createTempDir(): string {

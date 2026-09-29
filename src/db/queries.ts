@@ -2152,19 +2152,32 @@ export class QueryBuilder {
   }
 
   /**
-   * Cross-file edges whose TARGET is a node in `filePath` and whose SOURCE is a
-   * node in a *different* file, paired with the target node's (name, kind) so a
-   * caller can re-resolve the edge to the re-indexed target's new ID (node IDs
-   * are `sha256(filePath:kind:name:line)`, so any line shift in the callee file
-   * changes target IDs and a naive re-insert by old ID silently drops them).
-   * Used by `storeExtractionResult` to preserve incoming edges across a file
-   * re-index (issue #899). Same edge-kind rules as
-   * {@link getDependentFilePaths}: all kinds except `contains`.
+   * @brief 快照跨文件入向边及目标源码身份，供删除后安全重绑或恢复原始引用。
+   * @param[in] filePath 将要重索引或删除的目标文件相对路径
+   * @return 不含 contains 的跨文件入向边、目标身份和原源文件信息
+   * @note 同行独立定义标记必须在删除前保存；重索引后某个成员可能已消失。
    */
   getCrossFileIncomingEdgesWithTarget(
     filePath: string
-  ): Array<Edge & { targetName: string; targetKind: NodeKind; sourceFilePath: string; sourceLanguage: Language }> {
+  ): Array<Edge & {
+    targetName: string; targetKind: NodeKind; sourceFilePath: string; sourceLanguage: Language;
+    targetIdentity: Pick<Node, 'filePath' | 'language' | 'kind' | 'name' | 'qualifiedName' | 'signature' |
+      'startLine' | 'startColumn' | 'endLine' | 'endColumn'>;
+    targetIsDisambiguated: boolean;
+    targetSameLinePeerCount: number;
+  }> {
     const sql = `SELECT e.*, tgt.name AS target_name, tgt.kind AS target_kind,
+        tgt.file_path AS target_file_path, tgt.language AS target_language,
+        tgt.qualified_name AS target_qualified_name, tgt.signature AS target_signature,
+        tgt.start_line AS target_start_line, tgt.start_column AS target_start_column,
+        tgt.end_line AS target_end_line, tgt.end_column AS target_end_column,
+        (SELECT COUNT(*) FROM nodes peer
+          WHERE tgt.language IN ('c', 'cpp') AND tgt.kind IN ('function', 'method')
+            AND peer.file_path = tgt.file_path AND peer.kind = tgt.kind AND peer.name = tgt.name
+            AND peer.start_line = tgt.start_line AND peer.id != tgt.id
+            AND ((peer.end_line = tgt.start_line AND peer.end_column <= tgt.start_column)
+              OR (tgt.end_line = peer.start_line AND tgt.end_column <= peer.start_column))
+        ) AS target_same_line_peer_count,
         src.file_path AS source_file_path, src.language AS source_language
       FROM edges e
       JOIN nodes tgt ON tgt.id = e.target
@@ -2173,15 +2186,34 @@ export class QueryBuilder {
         AND e.kind != 'contains'
         AND src.file_path != ?`;
     const rows = this.db.prepare(sql).all(filePath, filePath) as Array<
-      EdgeRow & { target_name: string; target_kind: NodeKind; source_file_path: string; source_language: Language }
+      EdgeRow & {
+        target_name: string; target_kind: NodeKind; source_file_path: string; source_language: Language;
+        target_file_path: string; target_language: Language; target_qualified_name: string; target_signature: string | null;
+        target_start_line: number; target_start_column: number; target_end_line: number; target_end_column: number;
+        target_same_line_peer_count: number;
+      }
     >;
-    return rows.map(row => ({
-      ...rowToEdge(row),
-      targetName: row.target_name,
-      targetKind: row.target_kind,
-      sourceFilePath: row.source_file_path,
-      sourceLanguage: row.source_language,
-    }));
+    return rows.map(row => {
+      const targetIdentity = {
+        filePath: row.target_file_path, language: row.target_language, kind: row.target_kind, name: row.target_name,
+        qualifiedName: row.target_qualified_name, signature: row.target_signature ?? undefined,
+        startLine: row.target_start_line, startColumn: row.target_start_column,
+        endLine: row.target_end_line, endColumn: row.target_end_column,
+      };
+      return {
+        ...rowToEdge(row),
+        targetName: row.target_name,
+        targetKind: row.target_kind,
+        sourceFilePath: row.source_file_path,
+        sourceLanguage: row.source_language,
+        targetIdentity,
+        targetSameLinePeerCount: row.target_same_line_peer_count,
+        // 已独立存在的列号 ID 即使当前只剩一个成员，也不能退回同名猜测。
+        targetIsDisambiguated: (row.target_language === 'c' || row.target_language === 'cpp') &&
+          (row.target_kind === 'function' || row.target_kind === 'method') &&
+          (row.target_same_line_peer_count !== 0 || row.target === semanticCollisionNodeId(targetIdentity)),
+      };
+    });
   }
 
   // ===========================================================================

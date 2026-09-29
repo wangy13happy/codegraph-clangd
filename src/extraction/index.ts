@@ -22,6 +22,7 @@ import {
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
+import { semanticCollisionNodeId } from './tree-sitter-helpers';
 import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './parse-pool';
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
@@ -2417,13 +2418,7 @@ export class ExtractionOrchestrator {
     // `references` edges from callers that import it via module-attribute
     // access (`pkg.mod.fn(...)`).
     //
-    // We snapshot the edge plus the target node's (name, kind) so we can
-    // re-resolve to the re-indexed target's NEW id. Node ids are
-    // `sha256(filePath:kind:name:line)`, so any line shift in the callee file
-    // (e.g. a docstring-only edit above the symbol) changes every target id and
-    // a naive re-insert by old id would silently drop every edge. Matching by
-    // (filePath, kind, name) is stable across line shifts; if the symbol was
-    // renamed/removed, no match is found and the edge stays dropped (correct).
+    // 删除前保存目标源码身份；常规名字匹配保持 #899 的行移兼容，同行消歧组则不能互换。
     const crossFileIncomingEdges = existingFile
       ? this.queries.getCrossFileIncomingEdgesWithTarget(filePath)
       : [];
@@ -2517,8 +2512,9 @@ export class ExtractionOrchestrator {
     }
 
     // Re-insert cross-file incoming edges snapshotted before the delete,
-    // re-resolving each edge's target to the re-indexed node's new id by
-    // (filePath, kind, name). Node ids include the source line, so any line
+    // re-resolving each edge's target to the re-indexed node's new id. Ordinary
+    // targets use (filePath, kind, name); same-line collision groups require
+    // a verified source identity. Node ids include the source line, so any line
     // shift in the callee file (e.g. a docstring-only edit above the symbol)
     // changes every target id and a naive re-insert by old id would drop them
     // all. `insertEdges` still filters to endpoints that exist. This closes
@@ -2607,24 +2603,45 @@ export class ExtractionOrchestrator {
   }
 
   /**
-   * Re-attach cross-file incoming edges snapshotted before a re-index delete
-   * (#899): re-resolve each edge's target to the re-indexed node's new id by
-   * (kind, name); targets that vanished are resurrected as their original
-   * unresolved ref (#1240's removal-side counterpart) when the edge carries
-   * its refName stamp.
+   * @brief 重绑跨文件入向边，同行消歧定义仅凭可验证的唯一源码身份恢复目标。
+   * @param[in] crossFileIncomingEdges 删除前的边及目标身份快照
+   * @param[in] validNodes 本次实际存储的 canonical 节点
+   * @return 无；无法确认目标时按已有 refName/refKind 恢复原始未解析引用
    */
   private reattachCrossFileEdges(
-    crossFileIncomingEdges: Array<Edge & { targetKind: string; targetName: string; sourceFilePath: string; sourceLanguage: Language }>,
+    crossFileIncomingEdges: ReturnType<QueryBuilder['getCrossFileIncomingEdgesWithTarget']>,
     validNodes: Node[]
   ): void {
-    const newNodesByKindName = new Map<string, string>();
+    const newNodesByKindName = new Map<string, Node[]>();
     for (const n of validNodes) {
-      newNodesByKindName.set(`${n.kind}\0${n.name}`, n.id);
+      const key = `${n.kind}\0${n.name}`;
+      const group = newNodesByKindName.get(key);
+      if (group) group.push(n);
+      else newNodesByKindName.set(key, [n]);
     }
     const reinserted: Edge[] = [];
     const resurrected: UnresolvedReference[] = [];
     for (const e of crossFileIncomingEdges) {
-      const newTargetId = newNodesByKindName.get(`${e.targetKind}\0${e.targetName}`);
+      const candidates = newNodesByKindName.get(`${e.targetKind}\0${e.targetName}`) ?? [];
+      let newTargetId = candidates[candidates.length - 1]?.id;
+      if (e.targetIsDisambiguated || candidates.some(node =>
+        (node.language === 'c' || node.language === 'cpp') && (node.kind === 'function' || node.kind === 'method') &&
+        node.id === semanticCollisionNodeId(node))) {
+        const old = e.targetIdentity;
+        // 仅相同签名、限定名和行列形状可跨整体行移匹配；范围增长/成员位移不能用 overlap 猜靶。
+        const matching = candidates.filter(node => node.filePath === old.filePath && node.language === old.language &&
+          node.qualifiedName === old.qualifiedName && node.signature === old.signature &&
+          node.startColumn === old.startColumn && node.endColumn === old.endColumn &&
+          node.endLine - node.startLine === old.endLine - old.startLine);
+        const unchanged = matching.find(node => node.id === e.target &&
+          node.startLine === old.startLine && node.endLine === old.endLine);
+        const target = unchanged ?? (matching.length === 1 ? matching[0] : undefined);
+        // 无签名且同行组变化时，另一个等宽定义可复用原 ID 和范围，不能据此声称旧成员仍在。
+        const peers = target ? candidates.filter(peer => peer.id !== target.id && peer.startLine === target.startLine &&
+          (peer.endLine === target.startLine && peer.endColumn <= target.startColumn ||
+            target.endLine === peer.startLine && target.endColumn <= peer.startColumn)).length : 0;
+        newTargetId = target && (!!old.signature || peers === e.targetSameLinePeerCount) ? target.id : undefined;
+      }
       if (newTargetId) {
         reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });
       } else {
