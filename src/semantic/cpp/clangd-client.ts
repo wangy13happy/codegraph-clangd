@@ -32,7 +32,7 @@ export interface LspCallHierarchyItem {
 export interface LspIncomingCall { from: LspCallHierarchyItem; fromRanges: LspRange[] }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
-const SYNC_TIMEOUT_MS = 65_000;
+const DEFAULT_SYNC_TIMEOUT_MS = 10 * 60_000;
 const EXIT_WAIT_MS = 500;
 
 /**
@@ -77,7 +77,7 @@ export class ClangdClient {
    * @param[in] compileDirectory 单个视图的编译数据库目录
    * @param[in] runtime 可信用户侧解析的 clangd 路径和驱动白名单
    * @param[in] signal 索引取消信号
-   * @param[in] timeoutMs 每个协议请求的最大等待毫秒数
+   * @param[in] timeoutMs 显式请求等待预算；未指定时 sync 使用独立的有界默认预算
    * @return 无
    */
   constructor(private readonly root: string, private readonly compileDirectory: string,
@@ -85,8 +85,8 @@ export class ClangdClient {
     timeoutMs?: number) {
     if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) throw new Error('Invalid clangd request timeout');
     this.timeoutMs = timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-    // clangd 自身等待最多 60 秒；显式短超时仍适用于调用方取消/测试。
-    this.syncTimeoutMs = Math.min(timeoutMs ?? SYNC_TIMEOUT_MS, SYNC_TIMEOUT_MS);
+    // TU/索引任务及两轮 CDB/后台索引/模块各自可等 60 秒；默认总预算留余量且仍有限。
+    this.syncTimeoutMs = timeoutMs ?? DEFAULT_SYNC_TIMEOUT_MS;
   }
 
   /**

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -182,6 +182,41 @@ describe('C/C++ semantic fact collector', () => {
     expect(result.views.find(v => v.key === 'cmake:hung')?.failedFiles).toEqual(['variant.c']);
     expect(result.symbols.some(s => s.configId === result.views.find(v => v.key === 'cmake:good')?.id)).toBe(true);
   });
+
+  it('keeps sync bounded without truncating an explicit budget across two sequential idle phases', async () => {
+    const db = database([entry('variant.c', 'multi', ['-DMULTI_STAGE_SYNC'])]);
+    const directory = materializeCompileView(root, buildCompileViews(db)[0]!);
+    const client = new ClangdClient(root, directory, { clangdPath: executable, queryDrivers: [] }, undefined, 90_000);
+    try {
+      await client.start();
+      const uri = pathToFileURL(path.join(root, 'variant.c')).href;
+      client.didOpen(uri, 'c', fs.readFileSync(path.join(root, 'variant.c'), 'utf8'));
+      const timer = vi.spyOn(globalThis, 'setTimeout');
+      try {
+        await client.waitForIndex();
+        // 旧实现会把 90_000ms 截断到 65_000ms；只监视这一条 sync 请求的计时器。
+        expect(timer.mock.calls.some(call => call[1] === 90_000)).toBe(true);
+      } finally { timer.mockRestore(); }
+    } finally { await client.close(); }
+
+    const defaultClient = new ClangdClient(root, directory, { clangdPath: executable, queryDrivers: [] });
+    try {
+      await defaultClient.start();
+      const timer = vi.spyOn(globalThis, 'setTimeout');
+      try {
+        await defaultClient.waitForIndex();
+        expect(timer.mock.calls.some(call => typeof call[1] === 'number' &&
+          call[1] >= 8 * 60_000 && call[1] <= 10 * 60_000)).toBe(true);
+      } finally { timer.mockRestore(); }
+    } finally { await defaultClient.close(); }
+
+    const started = Date.now();
+    const result = await collectCppSemanticFacts(root, db, { clangdPath: executable, queryDrivers: [] },
+      { requestTimeoutMs: 500 });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(100);
+    expect(result.views[0]?.success).toBe(true);
+    expect(result.views[0]?.coveredFiles).toEqual(['variant.c']);
+  }, 10_000);
 
   it('keeps positive facts and marks only the failed view incomplete', async () => {
     const db = database([entry('variant.c', 'good', ['-DVARIANT_ONE']),

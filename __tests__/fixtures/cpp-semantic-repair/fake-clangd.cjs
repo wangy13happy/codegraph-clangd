@@ -132,6 +132,10 @@ function handle(message) {
   if (message.method === 'shutdown') { send(message.id, null); return; }
   if (message.method === 'sync') {
     if (args.includes('-DNO_SYNC')) send(message.id, null, { code: -32601, message: 'sync unsupported' });
+    else if (args.includes('-DMULTI_STAGE_SYNC')) {
+      // 两个独立的 55ms 空闲阶段累计 110ms，模拟各阶段都有余量但总量超过旧 65ms 缩尺。
+      setTimeout(() => setTimeout(() => respondWhenIdle(message.id), 55), 55);
+    }
     else if (!args.includes('-DHANG_SYNC')) respondWhenIdle(message.id);
     return;
   }
