@@ -61,10 +61,10 @@ function compareCandidate(left: Node, right: Node, fact: SemanticSymbolFact): nu
  * @param[in] db CodeGraph 已配置外键的 SQLite 连接
  * @param[in] queries 同一连接的图读写接口，用于一致地失效节点缓存
  * @param[in] collection PR2 采集的按配置分组的正向事实及覆盖状态
- * @return 本轮新增及基线复用节点数量；错误时所有变更整体回滚
+ * @return 本轮新增及基线复用节点数量、需要重试失败引用的名称；错误时整体回滚
  */
 export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuilder,
-  collection: SemanticFactCollection): { nodesAdded: number; nodesReused: number } {
+  collection: SemanticFactCollection): { nodesAdded: number; nodesReused: number; retryNames: string[] } {
   const ids = new Set(collection.views.map(view => view.id));
   if (ids.size !== collection.views.length || collection.views.some(view =>
     !view.id || !view.key || !/^[a-f0-9]{64}$/.test(view.flagsHash))) {
@@ -77,7 +77,8 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
     a.name.localeCompare(b.name) || a.startLine - b.startLine ||
     a.startColumn - b.startColumn || a.endLine - b.endLine ||
     a.configId.localeCompare(b.configId) || (a.signature ?? '').localeCompare(b.signature ?? ''));
-  const used = { nodesAdded: 0, nodesReused: 0 };
+  const used = { nodesAdded: 0, nodesReused: 0, retryNames: [] as string[] };
+  const retryNames = new Set<string>();
   db.transaction(() => {
     if (complete) {
       // 当前权威完整快照确认配置全集，故以前仅靠 advisory 建立的过期配置也可退役；
@@ -133,10 +134,14 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
           signature: fact.signature, semanticOrigin: 'clangd', updatedAt: now };
         queries.insertNode(winner);
         used.nodesAdded++;
+        retryNames.add(fact.name);
       } else {
         used.nodesReused++;
         for (const loser of candidates.slice(1)) {
-          if (loser.semanticOrigin) queries.mergeSemanticNode(winner.id, loser.id);
+          if (loser.semanticOrigin) {
+            queries.mergeSemanticNode(winner.id, loser.id);
+            retryNames.add(fact.name);
+          }
         }
         if (winner.semanticOrigin) {
           // 多配置签名起始行不同，但 canonical ID 不因后续配置集变化而重算。
@@ -167,5 +172,6 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
       `).run();
     }
   })();
+  used.retryNames = [...retryNames].sort();
   return used;
 }

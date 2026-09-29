@@ -54,7 +54,10 @@ import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
-import { loadDeprioritizePatterns } from './project-config';
+import { loadDeprioritizePatterns, loadCppSemanticRepairConfig, resolveCppSemanticRuntimeOptions } from './project-config';
+import { loadCompilationDatabase } from './semantic/cpp/compile-database';
+import { collectCppSemanticFacts } from './semantic/cpp';
+import { reconcileCppSemanticNodes } from './semantic/cpp/reconciler';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
@@ -623,6 +626,13 @@ export class CodeGraph {
             total: unresolvedCount,
           });
 
+          const semanticConfig = loadCppSemanticRepairConfig(this.projectRoot);
+          const semanticRuntime = semanticConfig ? resolveCppSemanticRuntimeOptions({}, process.env, this.projectRoot) : null;
+          const semanticDatabase = semanticConfig && semanticRuntime?.clangdPath
+            ? loadCompilationDatabase(this.projectRoot,
+              semanticRuntime.compileCommands ?? semanticConfig.compileCommands, !!semanticRuntime.compileCommands)
+            : null;
+          const semanticEnabled = !!semanticDatabase?.entries.length;
           const tResolve = Date.now();
           await this.resolveReferencesBatched(
             (current, total) => {
@@ -639,9 +649,31 @@ export class CodeGraph {
                 total: totalPasses,
               });
             },
-            walValve ? () => walValve!.backpressure() : undefined
+            walValve ? () => walValve!.backpressure() : undefined,
+            semanticEnabled
           );
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolution: ${Date.now() - tResolve}ms`);
+
+          if (semanticEnabled) {
+            try {
+              const facts = await collectCppSemanticFacts(this.projectRoot, semanticDatabase!, semanticRuntime!,
+                { signal: options.signal });
+              const repaired = reconcileCppSemanticNodes(this.db.getDb(), this.queries, facts);
+              // 基础解析预热了名称/节点缓存；新增语义身份必须在重试前可见。
+              this.resolver.clearCaches();
+              const retryable = this.queries.getRetryableFailedReferences(repaired.retryNames);
+              if (retryable.length) await this.resolver.resolveAndPersistListYielding(retryable);
+              this.queries.reconcileCppSemanticCalls(facts);
+            } catch (error) {
+              // 语义修复不影响普通索引完成，但采集/对账失败不能提供删除证据。
+              result.errors.push({ message: `C/C++ semantic repair failed: ${String(error)}`, severity: 'warning' });
+            } finally {
+              await this.resolver.synthesizeDynamicEdges(
+                (done, total) => options.onProgress?.({ phase: 'linking', current: done, total }),
+                walValve ? () => walValve!.backpressure() : undefined
+              );
+            }
+          }
 
           // Second pass: chained calls whose method lives on a supertype the
           // receiver conforms to (protocol-extension / inherited / default-
@@ -1233,7 +1265,8 @@ export class CodeGraph {
     // resolution is timer-driven passive checkpoints, which the pool's
     // continuous reads keep perpetually partial — the WAL then accretes the
     // whole phase's write volume (22GB on a 4.6GB DB at kernel scale).
-    backpressure?: () => Promise<void> | null
+    backpressure?: () => Promise<void> | null,
+    deferSynthesis: boolean = false
   ): Promise<ResolutionResult> {
     return this.resolver.resolveAndPersistBatched(onProgress, undefined, onSynthesisProgress, {
       dbPath: this.db.getPath(),
@@ -1251,7 +1284,7 @@ export class CodeGraph {
         end: () => this.db.endBulkRefLoad(),
       },
       backpressure,
-    });
+    }, deferSynthesis);
   }
 
   /**

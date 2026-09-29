@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -9,8 +9,15 @@ import { generateNodeId, semanticCollisionNodeId } from '../src/extraction/tree-
 import { extractFromSource } from '../src/extraction/tree-sitter';
 import { initGrammars, loadGrammarsForLanguages } from '../src/extraction/grammars';
 import { reconcileCppSemanticNodes } from '../src/semantic/cpp/reconciler';
-import { SemanticFactCollection } from '../src/semantic/cpp';
+import { collectCppSemanticFacts, SemanticFactCollection } from '../src/semantic/cpp';
+import { createResolver } from '../src/resolution';
 import { Node } from '../src/types';
+import { CodeGraph } from '../src';
+
+vi.mock('../src/semantic/cpp', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/semantic/cpp')>(),
+  collectCppSemanticFacts: vi.fn(),
+}));
 
 describe('C/C++ semantic node reconciliation', () => {
   let directory: string;
@@ -600,5 +607,251 @@ describe('C/C++ semantic node reconciliation', () => {
     expect(conn.getDb().prepare('SELECT * FROM semantic_node_configs').all()).toEqual(before);
     expect(conn.getDb().prepare('SELECT id FROM semantic_configs').all()).toEqual([{ id: 'one' }]);
     expect(queries.getNodesByFile('variant.c').map(node => node.name)).toEqual(['feature']);
+  });
+
+  it('retries only failed refs to a repaired function after invalidating resolver caches', async () => {
+    fs.writeFileSync(path.join(directory, 'caller.c'), 'int caller(void) { return feature(); }\n');
+    fs.writeFileSync(path.join(directory, 'variant.c'), 'int feature(void) { return 1; }\n');
+    const caller = baseline('caller.c', 'caller', 1, 1);
+    queries.insertNode(caller);
+    queries.insertUnresolvedRefsBatch([
+      { fromNodeId: caller.id, referenceName: 'feature', referenceKind: 'calls',
+        line: 1, column: 26, filePath: 'caller.c', language: 'c' },
+      { fromNodeId: caller.id, referenceName: 'unrelated', referenceKind: 'calls',
+        line: 1, column: 30, filePath: 'caller.c', language: 'c' },
+    ]);
+    const resolver = createResolver(directory, queries);
+    await resolver.resolveAndPersistBatched(undefined, 2, undefined, undefined, true);
+    expect(queries.getRetryableFailedReferences(['feature'])).toHaveLength(1);
+    const repaired = reconcileCppSemanticNodes(conn.getDb(), queries,
+      collection(['one'], [fact('one', 'variant.c', 'feature', 1, 1)]));
+    expect(repaired.retryNames).toEqual(['feature']);
+    resolver.clearCaches();
+    await resolver.resolveAndPersistListYielding(queries.getRetryableFailedReferences(repaired.retryNames));
+    expect(queries.getRetryableFailedReferences(['feature'])).toEqual([]);
+    expect(queries.getRetryableFailedReferences(['unrelated'])).toHaveLength(1);
+    expect(queries.getOutgoingEdges(caller.id).filter(edge => edge.kind === 'calls'))
+      .toMatchObject([{ target: generateNodeId('variant.c', 'function', 'feature', 1) }]);
+  });
+
+  it('preserves exact baseline edge IDs and all verified call-site coordinates across views', () => {
+    const caller = baseline('caller.c', 'caller', 10, 30);
+    const target = baseline('variant.c', 'feature', 2, 8);
+    queries.insertNodes([caller, target]);
+    queries.insertEdge({ source: caller.id, target: target.id, kind: 'calls', line: 14,
+      column: 4, provenance: 'tree-sitter' });
+    queries.insertEdge({ source: caller.id, target: target.id, kind: 'calls', line: 18,
+      column: 0, provenance: 'tree-sitter' });
+    const original = conn.getDb().prepare('SELECT id FROM edges WHERE line = 14').get() as { id: number };
+    const input = collection(['one', 'two'], ['one', 'two'].flatMap(id => [
+      fact(id, 'caller.c', 'caller', 10, 30), fact(id, 'variant.c', 'feature', 2, 8),
+    ]));
+    for (const view of input.views) {
+      view.coveredFiles = ['caller.c', 'variant.c'];
+      view.analyzedTuCount = 2;
+    }
+    input.calls = [
+      { configId: 'one', caller: fact('one', 'caller.c', 'caller', 10, 30),
+        callee: fact('one', 'variant.c', 'feature', 2, 8), callLine: 14, callColumn: 4 },
+      { configId: 'two', caller: fact('two', 'caller.c', 'caller', 10, 30),
+        callee: fact('two', 'variant.c', 'feature', 2, 8), callLine: 14, callColumn: 4 },
+      { configId: 'one', caller: fact('one', 'caller.c', 'caller', 10, 30),
+        callee: fact('one', 'variant.c', 'feature', 2, 8), callLine: 18, callColumn: 7 },
+      { configId: 'two', caller: fact('two', 'caller.c', 'caller', 10, 30),
+        callee: fact('two', 'variant.c', 'feature', 2, 8), callLine: 21, callColumn: 9 },
+    ];
+    reconcileCppSemanticNodes(conn.getDb(), queries, input);
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 2, removed: 1 });
+    expect(conn.getDb().prepare('SELECT id,line,col,provenance FROM edges ORDER BY line').all())
+      .toEqual([{ id: original.id, line: 14, col: 4, provenance: 'tree-sitter' },
+        { id: expect.any(Number), line: 18, col: 7, provenance: 'clangd' },
+        { id: expect.any(Number), line: 21, col: 9, provenance: 'clangd' }]);
+    expect(conn.getDb().prepare('SELECT config_id FROM semantic_edge_configs WHERE edge_id = ? ORDER BY config_id')
+      .all(original.id)).toEqual([{ config_id: 'one' }, { config_id: 'two' }]);
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 0, removed: 0 });
+    input.calls = input.calls.filter(call => call.configId !== 'two' || call.callLine !== 14);
+    expect(queries.reconcileCppSemanticCalls({ ...input, inventory: 'advisory' })).toEqual({ added: 0, removed: 0 });
+    expect(conn.getDb().prepare('SELECT config_id FROM semantic_edge_configs WHERE edge_id = ? ORDER BY config_id')
+      .all(original.id)).toEqual([{ config_id: 'one' }, { config_id: 'two' }]);
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 0, removed: 0 });
+    expect(conn.getDb().prepare('SELECT config_id FROM semantic_edge_configs WHERE edge_id = ?')
+      .all(original.id)).toEqual([{ config_id: 'one' }]);
+  });
+
+  it('corrects a wrong static target only with complete coverage and retains heuristic dispatch', () => {
+    const caller = baseline('caller.c', 'caller', 10, 30);
+    const correct = baseline('right.c', 'helper', 2, 7);
+    const wrong = baseline('wrong.c', 'helper', 2, 7);
+    queries.insertNodes([caller, correct, wrong]);
+    queries.insertEdge({ source: caller.id, target: wrong.id, kind: 'calls', line: 16, column: 4 });
+    queries.insertEdge({ source: caller.id, target: wrong.id, kind: 'calls', line: 17,
+      column: 0, provenance: 'heuristic' });
+    const input = collection(['one'], [fact('one', 'caller.c', 'caller', 10, 30),
+      fact('one', 'right.c', 'helper', 2, 7)]);
+    input.views[0]!.coveredFiles = ['caller.c', 'right.c'];
+    input.views[0]!.analyzedTuCount = 2;
+    input.calls = [{ configId: 'one', caller: fact('one', 'caller.c', 'caller', 10, 30),
+      callee: fact('one', 'right.c', 'helper', 2, 7), callLine: 16, callColumn: 4 }];
+    reconcileCppSemanticNodes(conn.getDb(), queries, input);
+    const partial = { ...input, inventory: 'advisory' as const };
+    expect(queries.reconcileCppSemanticCalls(partial)).toEqual({ added: 1, removed: 0 });
+    expect(queries.getOutgoingEdges(caller.id, ['calls'])).toHaveLength(3);
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 0, removed: 1 });
+    expect(queries.getOutgoingEdges(caller.id, ['calls'])).toMatchObject([
+      { target: wrong.id, provenance: 'heuristic' },
+      { target: correct.id, provenance: 'clangd' },
+    ]);
+  });
+
+  it('deletes an absent ordinary call only when its caller and callee are both represented and covered', () => {
+    const caller = baseline('caller.c', 'caller', 10, 30);
+    const target = baseline('variant.c', 'feature', 2, 8);
+    queries.insertNodes([caller, target]);
+    queries.insertEdge({ source: caller.id, target: target.id, kind: 'calls', line: 16, column: 0 });
+    const input = collection(['one'], [fact('one', 'caller.c', 'caller', 10, 30),
+      fact('one', 'variant.c', 'feature', 2, 8)]);
+    input.views[0]!.coveredFiles = ['caller.c', 'variant.c'];
+    input.views[0]!.analyzedTuCount = 2;
+    reconcileCppSemanticNodes(conn.getDb(), queries, input);
+    input.views[0]!.success = false;
+    input.views[0]!.failedFiles = ['caller.c'];
+    expect(queries.reconcileCppSemanticCalls(input).removed).toBe(0);
+    input.views[0]!.success = true;
+    input.views[0]!.failedFiles = [];
+    expect(queries.reconcileCppSemanticCalls(input).removed).toBe(1);
+    expect(queries.getOutgoingEdges(caller.id, ['calls'])).toEqual([]);
+  });
+
+  it('never overwrites an exact heuristic call when its identity matches semantic evidence', () => {
+    const caller = baseline('caller.c', 'caller', 10, 30);
+    const target = baseline('variant.c', 'feature', 2, 8);
+    queries.insertNodes([caller, target]);
+    queries.insertEdge({ source: caller.id, target: target.id, kind: 'calls', line: 16,
+      column: 4, provenance: 'heuristic' });
+    const input = collection(['one'], [fact('one', 'caller.c', 'caller', 10, 30),
+      fact('one', 'variant.c', 'feature', 2, 8)]);
+    input.views[0]!.coveredFiles = ['caller.c', 'variant.c'];
+    input.views[0]!.analyzedTuCount = 2;
+    input.calls = [{ configId: 'one', caller: fact('one', 'caller.c', 'caller', 10, 30),
+      callee: fact('one', 'variant.c', 'feature', 2, 8), callLine: 16, callColumn: 4 }];
+    reconcileCppSemanticNodes(conn.getDb(), queries, input);
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 0, removed: 0 });
+    expect(queries.getOutgoingEdges(caller.id, ['calls']))
+      .toMatchObject([{ provenance: 'heuristic', line: 16, column: 4 }]);
+    expect(conn.getDb().prepare('SELECT * FROM semantic_edge_configs').all()).toEqual([]);
+  });
+
+  it('rolls back a newly inserted semantic edge if membership persistence fails', () => {
+    const caller = baseline('caller.c', 'caller', 10, 30);
+    const target = baseline('variant.c', 'feature', 2, 8);
+    queries.insertNodes([caller, target]);
+    const input = collection(['one'], [fact('one', 'caller.c', 'caller', 10, 30),
+      fact('one', 'variant.c', 'feature', 2, 8)]);
+    input.views[0]!.coveredFiles = ['caller.c', 'variant.c'];
+    input.views[0]!.analyzedTuCount = 2;
+    input.calls = [{ configId: 'one', caller: fact('one', 'caller.c', 'caller', 10, 30),
+      callee: fact('one', 'variant.c', 'feature', 2, 8), callLine: 16, callColumn: 4 }];
+    reconcileCppSemanticNodes(conn.getDb(), queries, input);
+    conn.getDb().exec(`
+      CREATE TRIGGER fail_semantic_edge BEFORE INSERT ON semantic_edge_configs
+      BEGIN SELECT RAISE(ABORT, 'simulated edge membership failure'); END;
+    `);
+    expect(() => queries.reconcileCppSemanticCalls(input)).toThrow(/simulated edge membership failure/);
+    expect(queries.getOutgoingEdges(caller.id, ['calls'])).toEqual([]);
+    expect(conn.getDb().prepare('SELECT * FROM semantic_edge_configs').all()).toEqual([]);
+  });
+
+  it('runs semantic calls before C function-pointer synthesis in an opted-in full index', async () => {
+    const source = [
+      'struct ops { int (*fn)(void); };',
+      '#if FLAG',
+      'static int',
+      '#else',
+      'static long',
+      '#endif',
+      'handler(void) { return 1; }',
+      'static struct ops table = { .fn = handler };',
+      'int dispatch(struct ops *o) {',
+      '  handler();',
+      '  return o->fn();',
+      '}',
+      '',
+    ].join('\n');
+    fs.writeFileSync(path.join(directory, 'test.c'), source);
+    fs.writeFileSync(path.join(directory, 'codegraph.json'), JSON.stringify({ cppSemanticRepair: { enabled: true } }));
+    fs.writeFileSync(path.join(directory, 'compile_commands.json'), JSON.stringify([{
+      directory, file: path.join(directory, 'test.c'), arguments: ['cc', '-c', 'test.c', '-o', 'CMakeFiles/demo.dir/test.c.o'],
+      output: 'CMakeFiles/demo.dir/test.c.o',
+    }]));
+    const extracted = extractFromSource('test.c', source, 'c');
+    const handler = fact('one', 'test.c', 'handler', 3, 7);
+    const dispatch = extracted.nodes.find(node => node.name === 'dispatch' && node.kind === 'function')!;
+    expect(extracted.nodes.some(node => node.name === 'handler' && node.kind === 'function')).toBe(false);
+    expect(dispatch).toBeDefined();
+    const input = collection(['one'], [
+      handler,
+      { ...dispatch, kind: 'function', configId: 'one' },
+    ]);
+    input.views[0]!.coveredFiles = ['test.c'];
+    input.calls = [{ configId: 'one',
+      caller: { ...dispatch, kind: 'function' }, callee: handler,
+      callLine: 10, callColumn: 2 }];
+    vi.mocked(collectCppSemanticFacts).mockResolvedValueOnce(input);
+    const previous = process.env.CODEGRAPH_CLANGD_PATH;
+    process.env.CODEGRAPH_CLANGD_PATH = process.execPath;
+    let graph: CodeGraph | undefined;
+    try {
+      graph = await CodeGraph.init(directory, { silent: true });
+      const indexed = await graph.indexAll();
+      expect(indexed.success).toBe(true);
+      expect(vi.mocked(collectCppSemanticFacts)).toHaveBeenCalledOnce();
+      const graphDb = (graph as unknown as { db: DatabaseConnection }).db.getDb();
+      expect(graphDb.prepare(`
+        SELECT e.line,e.col,e.provenance,json_extract(e.metadata,'$.synthesizedBy') synthesized,
+          EXISTS(SELECT 1 FROM semantic_edge_configs c WHERE c.edge_id=e.id) verified
+        FROM edges e JOIN nodes s ON s.id=e.source JOIN nodes t ON t.id=e.target
+        WHERE s.name='dispatch' AND t.name='handler' AND e.kind='calls' ORDER BY e.line
+      `).all()).toEqual(expect.arrayContaining([
+        { line: 10, col: 2, provenance: null, synthesized: null, verified: 1 },
+        { line: expect.any(Number), col: null, provenance: 'heuristic', synthesized: 'fn-pointer-dispatch', verified: 0 },
+      ]));
+    } finally {
+      graph?.close();
+      if (previous === undefined) delete process.env.CODEGRAPH_CLANGD_PATH;
+      else process.env.CODEGRAPH_CLANGD_PATH = previous;
+    }
+  });
+
+  it('keeps the ordinary resolver synthesis and statistics when semantic repair is disabled', async () => {
+    fs.writeFileSync(path.join(directory, 'ordinary.c'), [
+      'static int handler(void) { return 1; }',
+      'struct ops { int (*fn)(void); };',
+      'static struct ops table = { .fn = handler };',
+      'int dispatch(struct ops *o) { return o->fn(); }',
+      '',
+    ].join('\n'));
+    vi.mocked(collectCppSemanticFacts).mockClear();
+    const graph = await CodeGraph.init(directory, { silent: true });
+    try {
+      const resolver = (graph as unknown as { resolver: ReturnType<typeof createResolver> }).resolver;
+      const base = vi.spyOn(resolver, 'resolveAndPersistBatched');
+      const delayed = vi.spyOn(resolver, 'synthesizeDynamicEdges');
+      expect((await graph.indexAll()).success).toBe(true);
+      expect(base).toHaveBeenCalledOnce();
+      expect(base.mock.calls[0]![4]).toBe(false);
+      expect(base.mock.results[0]?.type).toBe('return');
+      const resolved = await base.mock.results[0]!.value;
+      const graphDb = (graph as unknown as { db: DatabaseConnection }).db.getDb();
+      const synthesized = graphDb.prepare(`
+        SELECT COUNT(*) count FROM edges WHERE provenance = 'heuristic'
+          AND json_extract(metadata, '$.synthesizedBy') = 'fn-pointer-dispatch'
+      `).get() as { count: number };
+      expect(synthesized.count).toBeGreaterThan(0);
+      expect(resolved.stats.byMethod['callback-synthesis']).toBeGreaterThan(0);
+      expect(delayed).not.toHaveBeenCalled();
+      expect(collectCppSemanticFacts).not.toHaveBeenCalled();
+    } finally {
+      graph.close();
+    }
   });
 });

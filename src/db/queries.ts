@@ -25,6 +25,7 @@ import { splitIdentifierSegments } from '../search/identifier-segments';
 import { semanticRangesOverlap, assertPairwiseSemanticOverlap,
   areDisjointCppIdCollisions } from '../semantic/cpp/facts';
 import { generateNodeId, semanticCollisionNodeId } from '../extraction/tree-sitter-helpers';
+import type { SemanticFactCollection, SemanticSymbolIdentity } from '../semantic/cpp';
 
 /**
  * Files that should not be candidates for "dominant file" detection: test/spec
@@ -523,6 +524,154 @@ export class QueryBuilder {
       this.insertEdge({ ...rowToEdge(edge), target: winner });
     }
     this.deleteNode(loser);
+  }
+
+  /**
+   * @brief 将 clangd 入向调用及配置归属对账到普通 C/C++ 调用边。
+   * @param[in] collection 已完成节点修复的视图事实和运行时覆盖状态
+   * @return 新建边和退役旧边数量；事实非法或写入失败时整批回滚
+   */
+  reconcileCppSemanticCalls(collection: SemanticFactCollection): { added: number; removed: number } {
+    const viewIds = new Set(collection.views.map(view => view.id));
+    if (viewIds.size !== collection.views.length) throw new Error('Invalid C/C++ call view inventory');
+    /**
+     * @brief 防止外部或畸形调用事实进入图写入事务。
+     * @param[in] identity 项目相对源码定义身份
+     * @return 文件、类型和行列均有效时为 true
+     */
+    const validIdentity = (identity: SemanticSymbolIdentity): boolean =>
+      !!identity && !!identity.filePath && !/^(?:\/|[A-Za-z]:[\\/])/.test(identity.filePath) &&
+      !identity.filePath.split(/[\\/]/).includes('..') && !!identity.name &&
+      (identity.kind === 'function' || identity.kind === 'method') &&
+      Number.isSafeInteger(identity.startLine) && identity.startLine > 0 &&
+      Number.isSafeInteger(identity.endLine) && identity.endLine >= identity.startLine &&
+      Number.isSafeInteger(identity.startColumn) && identity.startColumn >= 0 &&
+      Number.isSafeInteger(identity.endColumn) && identity.endColumn >= 0 &&
+      (identity.endLine !== identity.startLine || identity.endColumn >= identity.startColumn);
+    for (const call of collection.calls) {
+      if (!viewIds.has(call.configId) || !validIdentity(call.caller) || !validIdentity(call.callee) ||
+          !Number.isSafeInteger(call.callLine) || call.callLine < call.caller.startLine ||
+          call.callLine > call.caller.endLine || !Number.isSafeInteger(call.callColumn) || call.callColumn < 0) {
+        throw new Error('Invalid C/C++ semantic call fact');
+      }
+    }
+
+    const nodesByFile = new Map<string, Map<string, Node[]>>();
+    /**
+     * @brief 按文件、名称和定义源码范围唯一匹配已修复的图节点。
+     * @param[in] identity clangd 函数身份
+     * @return 唯一候选节点；无法消歧时返回 undefined
+     */
+    const match = (identity: SemanticSymbolIdentity): Node | undefined => {
+      let nodes = nodesByFile.get(identity.filePath);
+      if (!nodes) {
+        nodes = new Map();
+        for (const node of this.getNodesByFile(identity.filePath)) {
+          if (node.language !== 'c' && node.language !== 'cpp') continue;
+          const key = `${node.kind}\0${node.name}`;
+          const group = nodes.get(key) ?? [];
+          group.push(node);
+          nodes.set(key, group);
+        }
+        nodesByFile.set(identity.filePath, nodes);
+      }
+      const matches = (nodes.get(`${identity.kind}\0${identity.name}`) ?? [])
+        .filter(node => semanticRangesOverlap(node, identity));
+      // 同行 static 或桥接范围不能猜测其 ID；只有唯一源码身份可对账。
+      return matches.length === 1 ? matches[0] : undefined;
+    };
+    const represented = new Set<string>();
+    const representedSources = new Set<string>();
+    const representedTargets = new Set<string>();
+    for (const symbol of collection.symbols) {
+      const node = match(symbol);
+      if (node && viewIds.has(symbol.configId)) {
+        represented.add(`${symbol.configId}\0${node.id}`);
+        representedSources.add(node.id);
+        representedTargets.add(node.id);
+      }
+    }
+    const observed = new Map<string, { source: Node; target: Node; line: number; col: number; configs: Set<string> }>();
+    const eligibleNames = new Map<string, Set<string>>();
+    for (const call of collection.calls) {
+      const source = match(call.caller);
+      const target = match(call.callee);
+      if (!source || !target || !represented.has(`${call.configId}\0${target.id}`)) continue;
+      const key = JSON.stringify([source.id, target.id, call.callLine, call.callColumn]);
+      let entry = observed.get(key);
+      if (!entry) {
+        entry = { source, target, line: call.callLine, col: call.callColumn, configs: new Set() };
+        observed.set(key, entry);
+      }
+      entry.configs.add(call.configId);
+      if (represented.has(`${call.configId}\0${source.id}`)) {
+        let names = eligibleNames.get(source.id);
+        if (!names) { names = new Set(); eligibleNames.set(source.id, names); }
+        names.add(target.name);
+      }
+    }
+    /**
+     * @brief 检查调用者文件在所有相关权威视图均已成功覆盖。
+     * @param[in] file 项目相对源码文件路径
+     * @return 该文件能提供完整负面证据时为 true
+     */
+    const covered = (file: string): boolean => {
+      const relevant = collection.views.filter(view => view.coveredFiles.includes(file) || view.failedFiles.includes(file));
+      return collection.inventory === 'authoritative' && relevant.length > 0 && relevant.every(view =>
+        view.inventory === 'authoritative' && view.success && view.failedFiles.length === 0 &&
+        view.failedTuCount === 0 && view.coveredFiles.includes(file) &&
+        view.coveredFiles.length === view.analyzedTuCount);
+    };
+    const result = { added: 0, removed: 0 };
+    this.db.transaction(() => {
+      const select = this.db.prepare('SELECT id,provenance FROM edges WHERE source = ? AND target = ? AND kind = ? AND line = ? AND col = ?');
+      const insert = this.db.prepare("INSERT OR IGNORE INTO edges (source,target,kind,line,col,provenance) VALUES (?,?,'calls',?,?,'clangd')");
+      const member = this.db.prepare('INSERT OR IGNORE INTO semantic_edge_configs (edge_id,config_id) VALUES (?,?)');
+      const retireMember = this.db.prepare('DELETE FROM semantic_edge_configs WHERE edge_id = ? AND config_id = ?');
+      // 精确坐标是边身份：同一调用者/目标的不同调用点必须逐条保留。
+      for (const entry of observed.values()) {
+        let row = select.get(entry.source.id, entry.target.id, 'calls', entry.line, entry.col) as
+          { id: number; provenance: string | null } | undefined;
+        if (!row) {
+          result.added += insert.run(entry.source.id, entry.target.id, entry.line, entry.col).changes;
+          row = select.get(entry.source.id, entry.target.id, 'calls', entry.line, entry.col) as typeof row;
+        }
+        // 唯一索引可能已被 heuristic 占用；绝不改写其归属或删除它。
+        if (row && row.provenance !== 'heuristic') {
+          if (covered(entry.source.filePath)) {
+            // 完整覆盖方可撤销已验证边在旧视图里的归属；部分结果只附加正向事实。
+            for (const view of collection.views) {
+              if (view.coveredFiles.includes(entry.source.filePath)) retireMember.run(row.id, view.id);
+            }
+          }
+          for (const config of entry.configs) member.run(row.id, config);
+        }
+      }
+      const stale = this.db.prepare(`
+        SELECT e.id,e.target,e.line,e.col,t.name FROM edges e
+        JOIN nodes t ON t.id = e.target WHERE e.source = ? AND e.kind = 'calls'
+          AND (e.provenance IS NULL OR e.provenance != 'heuristic')
+      `);
+      const remove = this.db.prepare('DELETE FROM edges WHERE id = ?');
+      // 从已有目标反查可能需要删除的调用者；不逐个扫描无调用的所有函数。
+      const candidates = new Set(eligibleNames.keys());
+      for (const row of this.db.prepare(`
+        SELECT DISTINCT source FROM edges WHERE kind = 'calls'
+          AND target IN (SELECT value FROM json_each(?))
+      `).all(JSON.stringify([...representedTargets])) as Array<{ source: string }>) candidates.add(row.source);
+      for (const sourceId of candidates) {
+        if (!representedSources.has(sourceId)) continue;
+        const source = this.getNodeById(sourceId);
+        if (!source || !covered(source.filePath)) continue;
+        for (const edge of stale.all(sourceId) as Array<{ id: number; target: string; line: number | null; col: number | null; name: string }>) {
+          // 缺失事实只能否定已纳入语义清单的目标；错误 static 目标需有同名正向证据。
+          if (!representedTargets.has(edge.target) && !eligibleNames.get(sourceId)?.has(edge.name)) continue;
+          const key = JSON.stringify([sourceId, edge.target, edge.line, edge.col]);
+          if (!observed.has(key)) result.removed += remove.run(edge.id).changes;
+        }
+      }
+    })();
+    return result;
   }
 
   /**

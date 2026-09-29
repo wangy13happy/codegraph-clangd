@@ -1532,7 +1532,8 @@ export class ReferenceResolver {
        *  each per-batch DELETE's B-tree work (DatabaseConnection.beginBulkRefLoad). */
       refIndexLoad?: { begin: () => void; end: () => void | Promise<void> };
       backpressure?: () => Promise<void> | null;
-    }
+    },
+    deferSynthesis: boolean = false
   ): Promise<ResolutionResult> {
     // Resolution runs on the indexer's MAIN thread, and the #850 liveness
     // watchdog SIGKILLs a process whose event loop stalls past its window (60s
@@ -1937,19 +1938,17 @@ export class ReferenceResolver {
     // independent passes across its read-only workers — that's why its destroy
     // lives in the finally below, after synthesis, not at the end of the batch
     // loop. See docs/design/callback-edge-synthesis.md.
-    const tSynth = Date.now();
-    try {
-      aggregateStats.byMethod['callback-synthesis'] = await synthesizeCallbackEdges(
-        this.queries,
-        this.context,
-        onSynthesisProgress,
-        pool,
-        parallel?.backpressure
-      );
-    } catch {
-      // synthesis is additive and optional; ignore failures
+    if (!deferSynthesis) {
+      const tSynth = Date.now();
+      try {
+        aggregateStats.byMethod['callback-synthesis'] = await synthesizeCallbackEdges(
+          this.queries, this.context, onSynthesisProgress, pool, parallel?.backpressure
+        );
+      } catch {
+        // synthesis is additive and optional; ignore failures
+      }
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] callback-synthesis: ${Date.now() - tSynth}ms`);
     }
-    if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] callback-synthesis: ${Date.now() - tSynth}ms`);
     } finally {
       if (pool) await pool.destroy().catch(() => undefined);
     }
@@ -1965,6 +1964,21 @@ export class ReferenceResolver {
       unresolved: [],
       stats: aggregateStats,
     };
+  }
+
+  /**
+   * @brief 在语义节点、失败引用及直接调用对账后执行既有动态边合成。
+   * @param[in] onProgress 可选合成进度回调
+   * @param[in] backpressure 可选 WAL 写入背压回调
+   * @return 新增合成边数量；合成失败按既有 best-effort 语义返回零
+   */
+  async synthesizeDynamicEdges(onProgress?: (done: number, total: number) => void,
+    backpressure?: () => Promise<void> | null): Promise<number> {
+    try {
+      return await synthesizeCallbackEdges(this.queries, this.context, onProgress, null, backpressure);
+    } catch {
+      return 0;
+    }
   }
 
   /**
