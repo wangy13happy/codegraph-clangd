@@ -46,6 +46,7 @@
     "picomatch": "^4.0.3",
     "sisteransi": "^1.0.5",
     "tree-sitter-wasms": "^0.1.11",
+    "vscode-jsonrpc": "^9.0.3",
     "web-tree-sitter": "^0.25.3"
   },
   "devDependencies": {
