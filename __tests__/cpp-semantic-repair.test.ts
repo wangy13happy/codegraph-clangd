@@ -390,6 +390,67 @@ describe('C/C++ semantic node reconciliation', () => {
     expect(queries.getNodeById(original.id)?.semanticOrigin).toBeUndefined();
   });
 
+  it('keeps an old clangd identity separate when a same-line replacement reuses its ID and the view fails', () => {
+    const observed = { ...fact('one', 'variant.c', 'feature', 2, 2), endColumn: 18 };
+    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [observed]));
+    const original = queries.getNodesByFile('variant.c')[0]!;
+    const caller = baseline('caller.c', 'caller', 8, 10);
+    queries.insertNode(caller);
+    queries.insertEdge({ source: caller.id, target: original.id, kind: 'calls',
+      line: 9, column: 3, provenance: 'clangd' });
+    const edge = conn.getDb().prepare('SELECT id FROM edges WHERE source = ? AND target = ?')
+      .get(caller.id, original.id) as { id: number };
+    conn.getDb().prepare('INSERT INTO semantic_edge_configs (edge_id, config_id) VALUES (?,?)')
+      .run(edge.id, 'one');
+    const saved = queries.captureCppSemanticMembership(['variant.c']);
+    queries.deleteNodesByFile('variant.c');
+    const replacement = { ...baseline('variant.c', 'feature', 2, 2),
+      startColumn: 19, endColumn: 38 };
+    queries.insertNode(replacement);
+    queries.restoreCppSemanticMembership(saved);
+
+    const nodes = queries.getNodesByFile('variant.c').sort((a, b) => a.startColumn - b.startColumn);
+    expect(nodes).toHaveLength(2);
+    expect(nodes[0]).toMatchObject({ semanticOrigin: 'clangd', startColumn: 0 });
+    expect(nodes[1]).toMatchObject({ semanticOrigin: undefined, startColumn: 19 });
+    expect(nodes[0]!.id).not.toBe(nodes[1]!.id);
+    expect(nodes[1]!.id).toBe(replacement.id);
+    expect(nodes[0]!.id).toBe(semanticCollisionNodeId(original));
+    expect(conn.getDb().prepare('SELECT node_id,definition_col FROM semantic_node_configs').all())
+      .toEqual([{ node_id: nodes[0]!.id, definition_col: 0 }]);
+    expect(conn.getDb().prepare(`SELECT e.target,m.config_id FROM semantic_edge_configs m
+      JOIN edges e ON e.id=m.edge_id`).all()).toEqual([{ target: nodes[0]!.id, config_id: 'one' }]);
+
+    // 完整视图随后证实旧定义已消失时，剩下的新基线必须保持全量重建会生成的行号 ID。
+    const complete = collection(['one'], []);
+    reconcileCppSemanticNodes(conn.getDb(), queries, complete);
+    expect(queries.getNodesByFile('variant.c').map(node => node.id)).toEqual([replacement.id]);
+  });
+
+  it('does not restore a baseline membership or verified edge onto an unrelated same-ID replacement', () => {
+    const old = { ...baseline('variant.c', 'feature', 2, 2), endColumn: 18 };
+    queries.insertNode(old);
+    reconcileCppSemanticNodes(conn.getDb(), queries,
+      collection(['one'], [{ ...fact('one', 'variant.c', 'feature', 2, 2), endColumn: 18 }]));
+    const caller = baseline('caller.c', 'caller', 8, 10);
+    queries.insertNode(caller);
+    queries.insertEdge({ source: caller.id, target: old.id, kind: 'calls', line: 9,
+      column: 3, provenance: 'clangd' });
+    const edge = conn.getDb().prepare('SELECT id FROM edges WHERE target = ?')
+      .get(old.id) as { id: number };
+    conn.getDb().prepare('INSERT INTO semantic_edge_configs (edge_id, config_id) VALUES (?,?)')
+      .run(edge.id, 'one');
+    const saved = queries.captureCppSemanticMembership(['variant.c']);
+    queries.deleteNodesByFile('variant.c');
+    const replacement = { ...baseline('variant.c', 'feature', 2, 2),
+      startColumn: 19, endColumn: 38 };
+    queries.insertNode(replacement);
+    queries.restoreCppSemanticMembership(saved);
+    expect(conn.getDb().prepare('SELECT * FROM semantic_node_configs').all()).toEqual([]);
+    expect(conn.getDb().prepare('SELECT * FROM semantic_edge_configs').all()).toEqual([]);
+    expect(conn.getDb().prepare("SELECT * FROM edges WHERE kind = 'calls'").all()).toEqual([]);
+  });
+
   it('rejects a forged same-ID ordinary replacement without changing old provenance or edges', () => {
     const observed = { ...fact('one', 'variant.c', 'feature', 2, 2), endColumn: 18 };
     reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [observed]));

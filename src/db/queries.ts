@@ -726,17 +726,15 @@ export class QueryBuilder {
    * @return 节点及调用边的已验证配置归属；仅在相同身份重现后可恢复
    */
   captureCppSemanticMembership(files: string[]): {
-    semanticNodes: Node[];
+    identities: Node[];
     nodes: Array<{ node_id: string; config_id: string; signature: string | null;
       definition_line: number | null; definition_col: number | null;
       file_path: string; kind: string; name: string }>;
     edges: Array<{ source: string; target: string; kind: string; line: number | null;
       col: number | null; config_id: string; metadata: string | null; provenance: string | null }>;
   } {
-    if (!files.length) return { semanticNodes: [], nodes: [], edges: [] };
+    if (!files.length) return { identities: [], nodes: [], edges: [] };
     const paths = JSON.stringify(files);
-    const semanticNodes = files.flatMap(file => this.getNodesByFile(file)
-      .filter(node => node.semanticOrigin === 'clangd'));
     const nodes = this.db.prepare(`
       SELECT m.node_id,m.config_id,m.signature,m.definition_line,m.definition_col,
         n.file_path,n.kind,n.name FROM semantic_node_configs m
@@ -750,22 +748,32 @@ export class QueryBuilder {
         OR t.file_path IN (SELECT value FROM json_each(?))
     `).all(paths, paths) as ReturnType<QueryBuilder['captureCppSemanticMembership']>['edges'];
     const memberIds = new Set(nodes.map(row => row.node_id));
-    return { semanticNodes: semanticNodes.filter(node => memberIds.has(node.id)), nodes, edges };
+    const affectedIds = new Set([...memberIds, ...edges.flatMap(edge => [edge.source, edge.target])]);
+    const identities = files.flatMap(file => this.getNodesByFile(file))
+      .filter(node => affectedIds.has(node.id));
+    return { identities, nodes, edges };
   }
 
   /**
-   * @brief 恢复增量提取级联清掉、但仍对应同一现存节点或非启发式调用边的语义归属。
+   * @brief 按直接源码范围恢复增量提取级联删除的语义节点和调用边归属。
    * @param[in] saved 删除前采集的语义节点和边归属
-   * @return 无；不存在的身份不会因部分语义视图失败而被重新创建
+   * @return 无；不相交的现存定义不会继承旧归属，无法消歧时事务回滚
    */
   restoreCppSemanticMembership(saved: ReturnType<QueryBuilder['captureCppSemanticMembership']>): void {
     this.db.transaction(() => {
       const owners = new Map<string, string>();
-      for (const prior of saved.semanticNodes) {
+      for (const prior of saved.identities) {
         const current = this.getNodeById(prior.id);
         if (current) {
-          if (current.filePath === prior.filePath && current.kind === prior.kind && current.name === prior.name) {
+          if (current.filePath === prior.filePath && current.kind === prior.kind &&
+              current.name === prior.name && semanticRangesOverlap(current, prior)) {
             owners.set(prior.id, current.id);
+          } else if (prior.semanticOrigin === 'clangd') {
+            // 同一行另一列复用旧 ID 时，不能把旧语义归属与调用边交给新定义。
+            const separateId = semanticCollisionNodeId(prior);
+            if (this.getNodeById(separateId)) throw new Error('Semantic node ID collides with existing identity');
+            this.insertNode({ ...prior, id: separateId });
+            owners.set(prior.id, separateId);
           }
           continue;
         }
@@ -773,7 +781,7 @@ export class QueryBuilder {
           !candidate.semanticOrigin && candidate.kind === prior.kind && candidate.name === prior.name &&
           semanticRangesOverlap(candidate, prior));
         if (baseline) owners.set(prior.id, baseline.id);
-        else {
+        else if (prior.semanticOrigin === 'clangd') {
           // 普通提取未接管此身份；保留旧正向语义证据直到权威完整视图完成刷新。
           this.insertNode(prior);
           owners.set(prior.id, prior.id);
@@ -783,7 +791,8 @@ export class QueryBuilder {
       const restoreNode = this.db.prepare(`INSERT OR IGNORE INTO semantic_node_configs
         (node_id,config_id,signature,definition_line,definition_col) VALUES (?,?,?,?,?)`);
       for (const row of saved.nodes) {
-        const owner = owners.get(row.node_id) ?? row.node_id;
+        const owner = owners.get(row.node_id);
+        if (!owner) continue;
         const current = node.get(owner) as { file_path: string; kind: string; name: string } | undefined;
         if (current?.file_path === row.file_path && current.kind === row.kind && current.name === row.name) {
           restoreNode.run(owner, row.config_id, row.signature, row.definition_line, row.definition_col);
@@ -794,7 +803,10 @@ export class QueryBuilder {
       const restoreEdge = this.db.prepare('INSERT OR IGNORE INTO semantic_edge_configs (edge_id,config_id) VALUES (?,?)');
       const insertEdge = this.db.prepare(`INSERT OR IGNORE INTO edges
         (source,target,kind,line,col,metadata,provenance) VALUES (?,?,?,?,?,?,?)`);
+      const affectedIds = new Set(saved.identities.map(identity => identity.id));
       for (const row of saved.edges) {
+        if ((affectedIds.has(row.source) && !owners.has(row.source)) ||
+            (affectedIds.has(row.target) && !owners.has(row.target))) continue;
         const source = owners.get(row.source) ?? row.source;
         const target = owners.get(row.target) ?? row.target;
         if (!this.getNodeById(source) || !this.getNodeById(target)) continue;

@@ -17,6 +17,8 @@ export interface CompileCommandEntry {
 
 export interface CompilationDatabase {
   path: string;
+  /** 与 entries 同一次文件读取的原始字节 SHA-256，供成功输入指纹使用。 */
+  contentHash: string;
   entries: CompileCommandEntry[];
   includeDirectories: string[];
   excludedSources: number;
@@ -179,7 +181,8 @@ export function loadCompilationDatabase(projectRoot: string, explicitPath?: stri
   } catch { return null; }
   if (!dbPath) return null;
   try {
-    const raw: unknown = JSON.parse(fs.readFileSync(dbPath, 'utf-8'));
+    const bytes = fs.readFileSync(dbPath);
+    const raw: unknown = JSON.parse(bytes.toString('utf-8'));
     if (!Array.isArray(raw)) return null;
     const entries: CompileCommandEntry[] = [];
     const includes = new Set<string>();
@@ -254,7 +257,8 @@ export function loadCompilationDatabase(projectRoot: string, explicitPath?: stri
     }
     const allTargets = entries.every(entry => entry.target !== undefined);
     const authoritative = entries.length > 0 && incompleteCommands === 0 && allTargets && conflictingTargetFiles.size === 0;
-    return { path: dbPath, entries, includeDirectories: [...includes], excludedSources,
+    return { path: dbPath, contentHash: createHash('sha256').update(bytes).digest('hex'),
+      entries, includeDirectories: [...includes], excludedSources,
       inventory: authoritative ? 'authoritative' : 'advisory', grouping: allTargets ? 'cmake-target' : 'semantic-flags' };
   } catch { return null; }
 }

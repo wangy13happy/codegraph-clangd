@@ -81,7 +81,8 @@ export function resolveCppSemanticInputs(projectRoot: string): CppSemanticInputs
     const hash = createHash('sha256');
     hash.update(JSON.stringify([REPAIR_ALGORITHM_VERSION, clangdVersion, config,
       runtime.clangdPath, runtime.queryDrivers, database.path]));
-    hash.update(fs.readFileSync(database.path));
+    // 与条目解析共享同一次原始字节读取，避免原子替换把旧条目标记成新 DB 的成功指纹。
+    hash.update(database.contentHash);
     return { database, runtime, clangdVersion, fingerprint: hash.digest('hex') };
   } catch (error) {
     return { database, runtime, clangdVersion: null, fingerprint: null,

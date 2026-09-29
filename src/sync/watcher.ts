@@ -35,7 +35,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { isSourceFile, buildScopeIgnore, type ScopeIgnore } from '../extraction';
 import { loadExtensionOverrides, loadCppSemanticRepairConfig, PROJECT_CONFIG_FILENAME } from '../project-config';
-import { findCompilationDatabase } from '../semantic/cpp/compile-database';
+import { canonicalizePotentialPath, findCompilationDatabase, isWithinProject } from '../semantic/cpp/compile-database';
 import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
 import { isCodeGraphDataDir } from '../directory';
@@ -662,13 +662,22 @@ export class FileWatcher {
     if (supportsRecursiveWatch()) return;
     const config = loadCppSemanticRepairConfig(this.projectRoot);
     if (!config) return;
-    const database = findCompilationDatabase(this.projectRoot, config.compileCommands);
-    if (!database || this.dirWatchers.has(path.dirname(database))) return;
+    const root = fs.realpathSync(this.projectRoot);
+    const explicit = config.compileCommands && path.resolve(root, config.compileCommands);
+    const database = findCompilationDatabase(root, config.compileCommands);
+    // 显式指定的 DB 尚未创建时，只监听已存在且规范化后仍位于项目内的父目录。
+    const candidate = database ?? (explicit && canonicalizePotentialPath(explicit));
+    if (!candidate || !isWithinProject(root, candidate) ||
+        !fs.existsSync(path.dirname(candidate)) || this.dirWatchers.has(path.dirname(candidate))) return;
     try {
-      this.compileDatabaseWatcher = watchImpl(path.dirname(database), (_event, filename) => {
-        if (!this.stopped && filename != null && String(filename) === path.basename(database)) {
-          this.handleChange(normalizePath(path.relative(this.projectRoot, database)));
-        }
+      this.compileDatabaseWatcher = watchImpl(path.dirname(candidate), (_event, filename) => {
+        if (this.stopped || filename == null || String(filename) !== path.basename(candidate)) return;
+        const selected = findCompilationDatabase(root, config.compileCommands);
+        const current = selected ?? (explicit && canonicalizePotentialPath(explicit));
+        if (!current || !isWithinProject(root, current)) return;
+        if (current !== candidate) this.refreshCompilationDatabaseWatch();
+        // handleChange 对显式配置使用项目相对路径，而不是 symlink 目标路径。
+        this.handleChange(normalizePath(path.relative(root, explicit ?? current)));
       });
       this.compileDatabaseWatcher.on('error', error => {
         logWarn('Compilation database watcher unavailable; use codegraph sync for freshness',

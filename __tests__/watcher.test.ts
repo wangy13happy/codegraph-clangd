@@ -710,6 +710,42 @@ describe('FileWatcher', () => {
       } finally { watcher.stop(); }
     });
 
+    it.skipIf(process.platform !== 'linux')('watches the first creation of a configured database in an ignored build directory', async () => {
+      const build = path.join(testDir, 'build');
+      fs.mkdirSync(build);
+      fs.writeFileSync(path.join(testDir, '.gitignore'), 'build/\n');
+      fs.writeFileSync(path.join(testDir, 'codegraph.json'), JSON.stringify({
+        cppSemanticRepair: { enabled: true, compileCommands: 'build/compile_commands.json' },
+      }));
+      const listeners = new Map<string, (...args: string[]) => void>();
+      const fake = { close: () => {}, on: () => fake } as unknown as fs.FSWatcher;
+      __setFsWatchForTests(((dir: string, options: unknown, callback?: unknown) => {
+        listeners.set(dir, (typeof options === 'function' ? options : callback) as (...args: string[]) => void);
+        return fake;
+      }) as unknown as typeof fs.watch);
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 50 });
+      try {
+        expect(watcher.start()).toBe(true);
+        expect(listeners.has(build)).toBe(true);
+        fs.writeFileSync(path.join(build, 'compile_commands.json'), '[]');
+        listeners.get(build)!('rename', 'compile_commands.json');
+        await waitFor(() => syncFn.mock.calls.length > 0);
+        expect(syncFn.mock.calls[0]![0]).toBeUndefined();
+        syncFn.mockClear();
+        const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-watcher-outside-'));
+        try {
+          const escaped = path.join(outside, 'compile_commands.json');
+          fs.writeFileSync(escaped, '[]');
+          fs.unlinkSync(path.join(build, 'compile_commands.json'));
+          fs.symlinkSync(escaped, path.join(build, 'compile_commands.json'));
+          listeners.get(build)!('rename', 'compile_commands.json');
+          await new Promise(resolve => setTimeout(resolve, 150));
+          expect(syncFn).not.toHaveBeenCalled();
+        } finally { fs.rmSync(outside, { recursive: true, force: true }); }
+      } finally { watcher.stop(); }
+    });
+
     it('should expose edited paths via getPendingFiles before sync fires', async () => {
       // Slow debounce — pending entries are visible until the debounce fires.
       // The synthetic event is synchronous, so we can assert immediately.

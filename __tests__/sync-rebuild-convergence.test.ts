@@ -572,6 +572,40 @@ describe('C/C++ semantic sync convergence', () => {
     // 未选视图不能提供负面证据；该断言锁住的是图事实而非诊断计数。
   });
 
+  it('keeps disjoint same-line identities through a partial view then converges after full coverage', async () => {
+    const initial = semanticFacts(1);
+    initial.symbols.push({ ...initial.symbols[0]!, name: 'phantom', startColumn: 0,
+      endColumn: 18, signature: 'int phantom(void)' });
+    vi.mocked(collectCppSemanticFacts).mockResolvedValueOnce(initial);
+    graph = CodeGraph.initSync(root);
+    await graph.indexAll();
+    fs.writeFileSync(path.join(root, 'a.c'),
+      'int target(void) { return 2; } int phantom(void) { return 3; }\n');
+    const partial = semanticFacts(1);
+    partial.symbols = [];
+    partial.calls = [];
+    partial.views[0]!.success = false;
+    partial.views[0]!.coveredFiles = ['b.c'];
+    partial.views[0]!.failedFiles = ['a.c'];
+    partial.views[0]!.failedTuCount = 1;
+    vi.mocked(collectCppSemanticFacts).mockResolvedValueOnce(partial)
+      .mockResolvedValue(semanticFacts(1));
+    await graph.sync();
+    expect(graph.getCppSemanticRepairStatus()?.state).toBe('partial');
+    const interim = snapshot() as { nodes: Array<{ id: string; name: string; semantic_origin: string | null }> };
+    expect(interim.nodes.filter(node => node.name === 'phantom')).toHaveLength(2);
+    expect(interim.nodes.filter(node => node.name === 'phantom' && node.semantic_origin === 'clangd'))
+      .toHaveLength(1);
+    await graph.sync();
+    expect(graph.getCppSemanticRepairStatus()?.state).toBe('complete');
+    const synced = snapshot();
+    expect((synced as typeof interim).nodes.filter(node => node.name === 'phantom')).toHaveLength(1);
+    graph.destroy();
+    graph = await CodeGraph.recreate(root);
+    await graph.indexAll();
+    expect(snapshot()).toEqual(synced);
+  });
+
   it('removes source memberships and dangling calls on deletion before full repair', async () => {
     vi.mocked(collectCppSemanticFacts).mockImplementation(async () => {
       const facts = semanticFacts(1);
