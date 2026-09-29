@@ -372,6 +372,60 @@ export class QueryBuilder {
   // ===========================================================================
 
   /**
+   * @brief 普通节点复用 clangd ID 时核实源码身份，防止 UPSERT 误接管其他定义。
+   * @param[in] node 即将写入的普通提取节点
+   * @return 无；同 ID 旧节点不是同一源码定义时抛错
+   */
+  private verifySemanticNodeIdentity(node: Node): void {
+    if (node.semanticOrigin || (node.language !== 'c' && node.language !== 'cpp') ||
+        (node.kind !== 'function' && node.kind !== 'method')) return;
+    const existing = this.db.prepare('SELECT * FROM nodes WHERE id = ? AND semantic_origin = ?')
+      .get(node.id, 'clangd') as NodeRow | undefined;
+    if (existing && (existing.file_path !== node.filePath || existing.kind !== node.kind ||
+        existing.name !== node.name || !semanticRangesOverlap(node, {
+          startLine: existing.start_line, startColumn: existing.start_column,
+          endLine: existing.end_line, endColumn: existing.end_column,
+        }))) {
+      throw new Error('Ordinary node conflicts with existing semantic node ID');
+    }
+  }
+
+  /**
+   * @brief 事务内将旧语义身份的配置归属和可验证普通引用迁至获胜节点，再删除旧节点。
+   * @param[in] winner 保留的节点 ID，调用前必须已写入数据库
+   * @param[in] loser 待删除的 clangd 独占节点 ID
+   * @return 无；调用方负责包裹事务，未知来源的边仍随旧节点删除
+   */
+  mergeSemanticNode(winner: string, loser: string): void {
+    if (winner === loser) return;
+    const old = this.db.prepare('SELECT name FROM nodes WHERE id = ? AND semantic_origin = ?')
+      .get(loser, 'clangd') as { name: string } | undefined;
+    if (!old) throw new Error('Missing semantic node for identity merge');
+    this.db.prepare(`
+      INSERT INTO semantic_node_configs (node_id, config_id, signature, definition_line, definition_col)
+      SELECT ?, config_id, signature, definition_line, definition_col
+      FROM semantic_node_configs WHERE node_id = ?
+      ON CONFLICT(node_id, config_id) DO NOTHING
+    `).run(winner, loser);
+    const incoming = this.db.prepare(`
+      SELECT e.* FROM edges e JOIN nodes source ON source.id = e.source
+      WHERE e.target = ? AND e.source != ? AND e.kind = 'references'
+        AND e.provenance IS NULL AND e.metadata IS NOT NULL
+    `).all(loser, loser) as EdgeRow[];
+    for (const edge of incoming) {
+      const metadata = safeJsonParse(edge.metadata!, null) as Record<string, unknown> | null;
+      if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata) ||
+          typeof metadata.refName !== 'string' || !metadata.refName ||
+          referenceNameTail(metadata.refName) !== old.name ||
+          (metadata.refKind !== undefined && metadata.refKind !== 'references' &&
+            metadata.refKind !== 'function_ref')) continue;
+      // 保留原引用文字及行列，只转绑有原始引用戳的普通解析结果。
+      this.insertEdge({ ...rowToEdge(edge), target: winner });
+    }
+    this.deleteNode(loser);
+  }
+
+  /**
    * @brief 普通 C/C++ 提取写入前，把重叠的 clangd 独占身份归属转到基线 ID。
    * @param[in] node 即将写入的普通提取节点
    * @return 无；由调用者事务保证迁移与实际节点写入一起提交或回滚
@@ -389,15 +443,7 @@ export class QueryBuilder {
         startLine: row.start_line, startColumn: row.start_column,
         endLine: row.end_line, endColumn: row.end_column,
       })) continue;
-      // 即使行号派生 ID 不同也由基线接管；外键级联清除旧身份的悬挂边和引用，
-      // PR4 收集直接调用事实后重建正确的调用边，不盲目移植旧边。
-      this.db.prepare(`
-        INSERT INTO semantic_node_configs (node_id, config_id, signature, definition_line, definition_col)
-        SELECT ?, config_id, signature, definition_line, definition_col
-        FROM semantic_node_configs WHERE node_id = ?
-        ON CONFLICT(node_id, config_id) DO NOTHING
-      `).run(node.id, row.id);
-      this.deleteNode(row.id);
+      this.mergeSemanticNode(node.id, row.id);
     }
   }
 
@@ -449,6 +495,7 @@ export class QueryBuilder {
     this.nodeCache.delete(node.id);
 
     this.db.transaction(() => {
+      this.verifySemanticNodeIdentity(node);
       this.stmts.insertNode!.run({
         id: node.id,
         kind: node.kind,
@@ -521,6 +568,7 @@ export class QueryBuilder {
           continue;
         }
         this.nodeCache.delete(node.id);
+        this.verifySemanticNodeIdentity(node);
         rows.push([
           node.id,
           node.kind,

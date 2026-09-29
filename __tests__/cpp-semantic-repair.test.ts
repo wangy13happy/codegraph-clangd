@@ -152,6 +152,95 @@ describe('C/C++ semantic node reconciliation', () => {
     expect(queries.getNodeById(original.id)?.semanticOrigin).toBeUndefined();
   });
 
+  it('rejects a disjoint same-ID ordinary replacement without changing old provenance or edges', () => {
+    const observed = { ...fact('one', 'variant.c', 'feature', 2, 2), endColumn: 18 };
+    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [observed]));
+    const original = queries.getNodesByFile('variant.c')[0]!;
+    const caller = baseline('caller.c', 'caller', 30, 40);
+    queries.insertNode(caller);
+    queries.insertEdge({ source: caller.id, target: original.id, kind: 'references',
+      line: 35, column: 8, metadata: { refName: 'feature', refKind: 'function_ref' } });
+    const unrelated = { ...baseline('variant.c', 'feature', 2, 2), startColumn: 19, endColumn: 38 };
+    expect(unrelated.id).toBe(original.id);
+    expect(() => queries.insertNode(unrelated)).toThrow(/semantic node ID/);
+    expect(queries.getNodeById(original.id)).toMatchObject({
+      semanticOrigin: 'clangd', startColumn: 0, endColumn: 18,
+    });
+    expect(conn.getDb().prepare('SELECT node_id FROM semantic_node_configs').all())
+      .toEqual([{ node_id: original.id }]);
+    expect(conn.getDb().prepare('SELECT source,target,line,col FROM edges').all())
+      .toEqual([{ source: caller.id, target: original.id, line: 35, col: 8 }]);
+  });
+
+  it('rolls back a batch when one ordinary node conflicts with a disjoint semantic identity', () => {
+    const observed = { ...fact('one', 'variant.c', 'feature', 2, 2), endColumn: 18 };
+    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [observed]));
+    const unrelated = { ...baseline('variant.c', 'feature', 2, 2), startColumn: 19, endColumn: 38 };
+    expect(() => queries.insertNodes([baseline('variant.c', 'other', 8, 9), unrelated]))
+      .toThrow(/semantic node ID/);
+    expect(queries.getNodesByFile('variant.c')).toMatchObject([{
+      name: 'feature', startColumn: 0, semanticOrigin: 'clangd',
+    }]);
+    expect(conn.getDb().prepare('SELECT node_id FROM semantic_node_configs').all())
+      .toEqual([{ node_id: unrelated.id }]);
+  });
+
+  it('keeps a verified ordinary function reference across a different-ID baseline takeover', () => {
+    reconcileCppSemanticNodes(conn.getDb(), queries,
+      collection(['one'], [fact('one', 'variant.c', 'feature', 2, 12)]));
+    const original = queries.getNodesByFile('variant.c')[0]!;
+    const caller = baseline('caller.c', 'caller', 30, 40);
+    queries.insertNode(caller);
+    const metadata = { confidence: 1, resolvedBy: 'function-ref',
+      refName: 'feature', refKind: 'function_ref', fnRef: true };
+    queries.insertEdge({ source: caller.id, target: original.id, kind: 'references',
+      line: 35, column: 8, metadata });
+    queries.insertEdge({ source: caller.id, target: original.id, kind: 'references',
+      line: 36, column: 9 });
+    queries.insertEdge({ source: caller.id, target: original.id, kind: 'references',
+      line: 39, column: 12, metadata: { refName: 'other' } });
+    queries.insertEdge({ source: caller.id, target: original.id, kind: 'references',
+      line: 40, column: 13, metadata: { refName: 'feature', resolvedBy: 'name-match' } });
+    queries.insertEdge({ source: caller.id, target: original.id, kind: 'references',
+      line: 37, column: 10, metadata, provenance: 'heuristic' });
+    queries.insertEdge({ source: caller.id, target: original.id, kind: 'calls',
+      line: 38, column: 11, metadata: { refName: 'feature' }, provenance: 'clangd' });
+    const recovered = baseline('variant.c', 'feature', 5, 12);
+    queries.insertNodes([recovered]);
+    expect(queries.getNodesByFile('variant.c').map(node => node.id)).toEqual([recovered.id]);
+    const edges = conn.getDb().prepare('SELECT source,target,kind,line,col,metadata,provenance FROM edges').all();
+    expect(edges).toEqual([
+      { source: caller.id, target: recovered.id, kind: 'references',
+        line: 35, col: 8, metadata: JSON.stringify(metadata), provenance: null },
+      { source: caller.id, target: recovered.id, kind: 'references',
+        line: 40, col: 13, metadata: JSON.stringify({ refName: 'feature', resolvedBy: 'name-match' }), provenance: null },
+    ]);
+    expect(conn.getDb().prepare('SELECT * FROM unresolved_refs').all()).toEqual([]);
+    expect(conn.getDb().prepare('SELECT node_id FROM semantic_node_configs').all())
+      .toEqual([{ node_id: recovered.id }]);
+  });
+
+  it('uses the same verified reference transfer when overlapping semantic identities merge', () => {
+    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [
+      fact('one', 'variant.c', 'feature', 2, 6),
+      fact('one', 'variant.c', 'feature', 7, 11),
+    ]));
+    const [first, second] = queries.getNodesByFile('variant.c');
+    const caller = baseline('caller.c', 'caller', 30, 40);
+    queries.insertNode(caller);
+    queries.insertEdge({ source: caller.id, target: second!.id, kind: 'references',
+      line: 35, column: 8, metadata: { refName: 'feature', refKind: 'function_ref' } });
+    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [
+      fact('one', 'variant.c', 'feature', 4, 9),
+    ]));
+    expect(queries.getNodesByFile('variant.c').map(node => node.id)).toEqual([first!.id]);
+    expect(conn.getDb().prepare('SELECT source,target,line,col FROM edges').all()).toEqual([
+      { source: caller.id, target: first!.id, line: 35, col: 8 },
+    ]);
+    expect(conn.getDb().prepare('SELECT node_id FROM semantic_node_configs').all())
+      .toEqual([{ node_id: first!.id }]);
+  });
+
   it('transfers ownership in the bulk ordinary extraction path as well', () => {
     reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [fact('one', 'variant.c', 'feature', 2, 12)]));
     const extracted = baseline('variant.c', 'feature', 5, 12);

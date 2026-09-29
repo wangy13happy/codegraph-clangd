@@ -57,26 +57,6 @@ function compareCandidate(left: Node, right: Node, fact: SemanticSymbolFact): nu
 }
 
 /**
- * @brief 合并失去 canonical 身份的语义节点 membership 后删除旧身份。
- * @param[in] db 同一事务内的数据库适配器
- * @param[in] queries 已打开连接上的图操作接口
- * @param[in] winner canonical 节点 ID
- * @param[in] loser 待移除的 clangd 独占节点 ID
- * @return 无；依赖外层事务保证迁移与删除不可分割
- */
-function mergeSemanticNode(db: SqliteDatabase, queries: QueryBuilder, winner: string, loser: string): void {
-  if (winner === loser) return;
-  db.prepare(`
-    INSERT INTO semantic_node_configs (node_id, config_id, signature, definition_line, definition_col)
-    SELECT ?, config_id, signature, definition_line, definition_col
-    FROM semantic_node_configs WHERE node_id = ?
-    ON CONFLICT(node_id, config_id) DO NOTHING
-  `).run(winner, loser);
-  // 只搬运身份 membership；旧边可能关联错误目标，不把它盲目复制给新身份。
-  queries.deleteNode(loser);
-}
-
-/**
  * @brief 在单次事务里写入配置事实并按权威覆盖门槛退役孤立 clangd 身份。
  * @param[in] db CodeGraph 已配置外键的 SQLite 连接
  * @param[in] queries 同一连接的图读写接口，用于一致地失效节点缓存
@@ -146,7 +126,7 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
       } else {
         used.nodesReused++;
         for (const loser of candidates.slice(1)) {
-          if (loser.semanticOrigin) mergeSemanticNode(db, queries, winner.id, loser.id);
+          if (loser.semanticOrigin) queries.mergeSemanticNode(winner.id, loser.id);
         }
         if (winner.semanticOrigin) {
           // 多配置签名起始行不同，但 canonical ID 不因后续配置集变化而重算。
