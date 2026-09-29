@@ -144,6 +144,60 @@ it.each([false, true].flatMap(chunked => [
   }
 }, 20000);
 
+it.each([false, true].flatMap(chunked => [false, true].flatMap(ordinaryFirst =>
+  [false, true].map(collidesAfterEdit => ({ chunked, ordinaryFirst, collidesAfterEdit })))))(
+  'limits cross-file collision checks to the target group (chunked=$chunked, ordinaryFirst=$ordinaryFirst, collidesAfterEdit=$collidesAfterEdit)',
+  async ({ chunked, ordinaryFirst, collidesAfterEdit }) => {
+    const directory = createTempDir();
+    let graph: CodeGraph | undefined;
+    try {
+      const collision = 'int feature() { return 1; } int feature(int x) { return x; }';
+      const ordinary = 'int feature(double x) { return 1; }';
+      const source = ordinaryFirst ? `${ordinary}\n${collision}` : `${collision}\n${ordinary}`;
+      const filler = chunked ? '\n' + Array.from({ length: 2001 }, (_, i) => `void filler_${i}() {}`).join('\n') : '';
+      const calleePath = path.join(directory, 'variant.cpp');
+      fs.writeFileSync(calleePath, `${source}\n${filler}`);
+      fs.writeFileSync(path.join(directory, 'caller.cpp'),
+        'int callerStamped() { return 0; }\nint callerUnstamped() { return 0; }\n');
+      graph = CodeGraph.initSync(directory);
+      expect((await graph.indexFiles(['variant.cpp', 'caller.cpp'])).success).toBe(true);
+      const queries = (graph as unknown as { queries: QueryBuilder }).queries;
+      const target = graph.getNodesByKind('function').find(node => node.name === 'feature' &&
+        node.startLine === (ordinaryFirst ? 1 : 2))!;
+      const callers = ['callerStamped', 'callerUnstamped'].map(name =>
+        graph!.getNodesByKind('function').find(node => node.name === name)!);
+      queries.insertEdges(callers.map((caller, i) => ({
+        source: caller.id, target: target.id, kind: 'references', provenance: 'tree-sitter',
+        metadata: i === 0 ? { refName: 'api.feature', refKind: 'function_ref' } : undefined,
+        line: i + 1, column: i + 5,
+      })));
+      const before = callers.map(caller => graph!.getOutgoingEdges(caller.id));
+      const snapshots = queries.getCrossFileIncomingEdgesWithTarget('variant.cpp');
+      expect(snapshots).toHaveLength(2);
+      expect(snapshots.every(edge => !edge.targetIsDisambiguated && edge.targetSameLinePeerCount === 0)).toBe(true);
+      // 单独扩大普通目标不触发严格校验；本行新增独立成员时仍必须保护真正的新碰撞组。
+      const updatedOrdinary = ordinary.replace('return 1;', 'return 10000;') +
+        (collidesAfterEdit ? ' int feature(float x) { return 2; }' : '');
+      fs.writeFileSync(calleePath, `${source.replace(ordinary, updatedOrdinary)}\n${filler}`);
+      expect((await graph.indexFiles(['variant.cpp'])).success).toBe(true);
+      expect(graph.getNode(target.id)).toMatchObject({ startLine: target.startLine, startColumn: target.startColumn });
+      expect(graph.getNode(target.id)!.endColumn).toBeGreaterThan(target.endColumn);
+      if (chunked) expect(graph.getNodesByKind('function').length).toBeGreaterThan(2000);
+      for (let i = 0; i < callers.length; i++) {
+        expect(graph.getOutgoingEdges(callers[i]!.id)).toEqual(collidesAfterEdit ? [] : before[i]);
+        const pending = queries.getUnresolvedReferences().filter(ref => ref.fromNodeId === callers[i]!.id);
+        expect(pending).toEqual(collidesAfterEdit && i === 0 ? [expect.objectContaining({
+          fromNodeId: callers[i]!.id, referenceName: 'api.feature', referenceKind: 'function_ref',
+          filePath: 'caller.cpp', language: 'cpp', line: i + 1, column: i + 5,
+        })] : []);
+      }
+    } finally {
+      graph?.close();
+      cleanupTempDir(directory);
+    }
+  }, 20000
+);
+
 // Create a temporary directory for each test
 function createTempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-test-'));

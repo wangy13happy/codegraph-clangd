@@ -2623,11 +2623,18 @@ export class ExtractionOrchestrator {
     const resurrected: UnresolvedReference[] = [];
     for (const e of crossFileIncomingEdges) {
       const candidates = newNodesByKindName.get(`${e.targetKind}\0${e.targetName}`) ?? [];
-      let newTargetId = candidates[candidates.length - 1]?.id;
+      const old = e.targetIdentity;
+      // 普通定义的 ID/起点仍对应时保留该目标，不能被另一行的同名消歧组替换或误伤。
+      const original = !e.targetIsDisambiguated && (old.language === 'c' || old.language === 'cpp') &&
+        (old.kind === 'function' || old.kind === 'method') ? candidates.find(node => node.id === e.target &&
+          node.filePath === old.filePath && node.language === old.language &&
+          node.startLine === old.startLine && node.startColumn === old.startColumn) : undefined;
+      const replacement = original ?? candidates[candidates.length - 1];
+      let newTargetId = replacement?.id;
       if (e.targetIsDisambiguated || candidates.some(node =>
+        node.startLine === replacement?.startLine && node.filePath === replacement?.filePath &&
         (node.language === 'c' || node.language === 'cpp') && (node.kind === 'function' || node.kind === 'method') &&
         node.id === semanticCollisionNodeId(node))) {
-        const old = e.targetIdentity;
         // 仅相同签名、限定名和行列形状可跨整体行移匹配；范围增长/成员位移不能用 overlap 猜靶。
         const matching = candidates.filter(node => node.filePath === old.filePath && node.language === old.language &&
           node.qualifiedName === old.qualifiedName && node.signature === old.signature &&
