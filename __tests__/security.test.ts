@@ -18,6 +18,8 @@ import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
 import { DatabaseConnection, getDatabasePath } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
+import { clearProjectConfigCache, loadCppSemanticRepairConfig, resolveCppSemanticRuntimeOptions } from '../src/project-config';
+import { findCompilationDatabase, loadCompilationDatabase } from '../src/semantic/cpp/compile-database';
 
 function createTempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-security-test-'));
@@ -28,6 +30,60 @@ function cleanupTempDir(dir: string): void {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
+
+describe('C/C++ semantic compilation database trust boundary', () => {
+  let root: string;
+  let outside: string;
+  beforeEach(() => {
+    root = createTempDir();
+    outside = createTempDir();
+    clearProjectConfigCache();
+  });
+  afterEach(() => {
+    clearProjectConfigCache();
+    cleanupTempDir(root);
+    cleanupTempDir(outside);
+  });
+
+  it('rejects traversal and symlink escapes from repository configuration', () => {
+    const externalDb = path.join(outside, 'compile_commands.json');
+    fs.writeFileSync(externalDb, '[]');
+    fs.symlinkSync(externalDb, path.join(root, 'compile_commands.json'));
+    expect(findCompilationDatabase(root)).toBeNull();
+    for (const selected of [path.relative(root, externalDb), 'compile_commands.json']) {
+      fs.writeFileSync(path.join(root, 'codegraph.json'), JSON.stringify({
+        cppSemanticRepair: { enabled: true, compileCommands: selected },
+      }));
+      clearProjectConfigCache();
+      expect(loadCppSemanticRepairConfig(root)).toBeNull();
+    }
+    // Trusted runtime may select an external database without granting that power to codegraph.json.
+    expect(findCompilationDatabase(root, externalDb, true)).toBe(fs.realpathSync(externalDb));
+  });
+
+  it('filters external and symlinked translation units even with a trusted external database', () => {
+    fs.writeFileSync(path.join(root, 'local.c'), '');
+    fs.writeFileSync(path.join(outside, 'external.c'), '');
+    fs.symlinkSync(path.join(outside, 'external.c'), path.join(root, 'alias.c'));
+    fs.symlinkSync(outside, path.join(root, 'external-dir'));
+    fs.symlinkSync(path.join(outside, 'missing.c'), path.join(root, 'broken.c'));
+    const dbPath = path.join(outside, 'compile_commands.json');
+    fs.writeFileSync(dbPath, JSON.stringify([
+      { directory: root, file: 'local.c', output: 'CMakeFiles/app.dir/local.c.o', arguments: ['cc', 'local.c'] },
+      { directory: root, file: 'alias.c', arguments: ['cc', 'alias.c'] },
+      { directory: root, file: 'external-dir/not-generated.c', arguments: ['cc', 'external-dir/not-generated.c'] },
+      { directory: root, file: 'broken.c', arguments: ['cc', 'broken.c'] },
+      { directory: outside, file: 'external.c', arguments: ['cc', 'external.c'] },
+    ]));
+    expect(loadCompilationDatabase(root, dbPath)).toBeNull();
+    const result = loadCompilationDatabase(root, dbPath, true)!;
+    expect(result.entries.map(e => e.file)).toEqual(['local.c']);
+    expect(result.excludedSources).toBe(4);
+    expect(result.inventory).toBe('authoritative');
+    expect(resolveCppSemanticRuntimeOptions({ clangdPath: './vendor/clangd', clangdQueryDrivers: 'gcc' }, {}))
+      .toMatchObject({ clangdPath: null, queryDrivers: [] });
+  });
+});
 
 describe('FileLock', () => {
   let tempDir: string;

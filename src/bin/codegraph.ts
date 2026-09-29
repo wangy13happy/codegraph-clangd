@@ -53,6 +53,7 @@ import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime
 import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
+import { loadCppSemanticRepairConfig, resolveCppSemanticRuntimeOptions } from '../project-config';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -231,6 +232,34 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     /* telemetry must never break the CLI */
   }
 });
+
+/**
+ * @brief 将当前 CLI 调用的可信覆盖项交给同进程的索引/同步阶段。
+ * @param[in] projectPath 项目根目录，用于确认项目已启用语义修复
+ * @param[in] options 用户在命令行传入的路径和驱动允许列表
+ * @return 无；未启用项目配置时不改变进程环境
+ */
+function prepareCppSemanticRuntime(projectPath: string, options: {
+  clangdPath?: string; queryDriver?: string; compileCommands?: string;
+}): void {
+  if (!loadCppSemanticRepairConfig(projectPath)) return;
+  // CLI 参数仅存在于用户进程；仓库配置不能写入这些执行授权环境变量。
+  const runtime = resolveCppSemanticRuntimeOptions({
+    clangdPath: options.clangdPath,
+    clangdQueryDrivers: options.queryDriver,
+    compileCommands: options.compileCommands,
+  }, process.env, projectPath);
+  // 固定 PATH 当前实际命中的程序，避免后续分析器改变 cwd 再解析到项目内程序。
+  process.env.CODEGRAPH_CLANGD_PATH = runtime.clangdPath ?? '';
+  if (options.queryDriver !== undefined || process.env.CODEGRAPH_CLANGD_QUERY_DRIVERS !== undefined) {
+    if (runtime.queryDrivers.length) process.env.CODEGRAPH_CLANGD_QUERY_DRIVERS = runtime.queryDrivers.join(',');
+    else delete process.env.CODEGRAPH_CLANGD_QUERY_DRIVERS;
+  }
+  if (options.compileCommands !== undefined || process.env.CODEGRAPH_COMPILE_COMMANDS !== undefined) {
+    if (runtime.compileCommands) process.env.CODEGRAPH_COMPILE_COMMANDS = runtime.compileCommands;
+    else delete process.env.CODEGRAPH_COMPILE_COMMANDS;
+  }
+}
 
 // =============================================================================
 // Helper Functions
@@ -784,7 +813,10 @@ program
   .option('-f, --force', 'Index even if the path looks like your home directory or a filesystem root')
   .option('-q, --quiet', 'Suppress progress output')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
+  .option('--clangd-path <path>', 'Trusted clangd executable path (or clangd from PATH)')
+  .option('--query-driver <paths>', 'Trusted comma-separated absolute compiler-driver allowlist')
+  .option('--compile-commands <path>', 'Trusted compilation database override (may be outside project)')
+  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean; clangdPath?: string; queryDriver?: string; compileCommands?: string }) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
@@ -801,6 +833,8 @@ program
         info('Run "codegraph init" first');
         process.exit(1);
       }
+
+      prepareCppSemanticRuntime(projectPath, options);
 
       const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
       // `index` is a FULL re-index — identical to a fresh `init`. RECREATE the
@@ -879,7 +913,10 @@ program
   .command('sync [path]')
   .description('Sync changes since last index')
   .option('-q, --quiet', 'Suppress output (for git hooks)')
-  .action(async (pathArg: string | undefined, options: { quiet?: boolean }) => {
+  .option('--clangd-path <path>', 'Trusted clangd executable path (or clangd from PATH)')
+  .option('--query-driver <paths>', 'Trusted comma-separated absolute compiler-driver allowlist')
+  .option('--compile-commands <path>', 'Trusted compilation database override (may be outside project)')
+  .action(async (pathArg: string | undefined, options: { quiet?: boolean; clangdPath?: string; queryDriver?: string; compileCommands?: string }) => {
     const projectPath = resolveProjectPath(pathArg);
 
     try {
@@ -889,6 +926,8 @@ program
         }
         process.exit(1);
       }
+
+      prepareCppSemanticRuntime(projectPath, options);
 
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);

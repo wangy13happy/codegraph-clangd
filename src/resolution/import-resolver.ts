@@ -10,6 +10,7 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases } from './path-aliases';
 import { resolveWorkspaceImport } from './workspace-packages';
+import { loadCompilationDatabase } from '../semantic/cpp/compile-database';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -540,108 +541,8 @@ export function loadCppIncludeDirs(projectRoot: string): string[] {
  * fallback can run). Returns an array (possibly empty) otherwise.
  */
 function loadCppIncludeDirsFromCompileDB(projectRoot: string): string[] | null {
-  const candidates = [
-    path.join(projectRoot, 'compile_commands.json'),
-    path.join(projectRoot, 'build', 'compile_commands.json'),
-    path.join(projectRoot, 'cmake-build-debug', 'compile_commands.json'),
-    path.join(projectRoot, 'cmake-build-release', 'compile_commands.json'),
-    path.join(projectRoot, 'out', 'compile_commands.json'),
-  ];
-
-  let dbPath: string | undefined;
-  for (const c of candidates) {
-    try {
-      if (fs.existsSync(c)) {
-        dbPath = c;
-        break;
-      }
-    } catch {
-      // ignore
-    }
-  }
-  if (!dbPath) return null;
-
-  try {
-    const content = fs.readFileSync(dbPath, 'utf-8');
-    const entries = JSON.parse(content) as Array<{
-      directory: string;
-      command?: string;
-      arguments?: string[];
-    }>;
-    if (!Array.isArray(entries)) return null;
-
-    const dirSet = new Set<string>();
-    for (const entry of entries) {
-      const dir = entry.directory || projectRoot;
-      const args = entry.arguments || (entry.command ? shlexSplit(entry.command) : []);
-      for (let i = 0; i < args.length; i++) {
-        const arg = args[i]!;
-        let includeDir: string | undefined;
-        // -I<dir> (no space)
-        if (arg.startsWith('-I') && arg.length > 2) {
-          includeDir = arg.substring(2);
-        }
-        // -isystem <dir> (space-separated)
-        else if ((arg === '-isystem' || arg === '-I') && i + 1 < args.length) {
-          includeDir = args[i + 1];
-          i++; // skip next arg
-        }
-        if (includeDir) {
-          // Normalize: resolve relative to the compilation directory
-          const absPath = path.isAbsolute(includeDir)
-            ? includeDir
-            : path.resolve(dir, includeDir);
-          const relPath = path.relative(projectRoot, absPath).replace(/\\/g, '/');
-          // Skip system directories and paths outside the project
-          // (relative paths starting with .. or absolute paths like
-          // /usr/include or C:\usr on Windows)
-          if (!relPath.startsWith('..') && relPath.length > 0 && !path.isAbsolute(relPath)) {
-            dirSet.add(relPath);
-          }
-        }
-      }
-    }
-    return Array.from(dirSet);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Minimal shlex-style split for compiler command strings.
- * Handles double-quoted and single-quoted arguments.
- */
-function shlexSplit(cmd: string): string[] {
-  const result: string[] = [];
-  let i = 0;
-  while (i < cmd.length) {
-    // Skip whitespace
-    while (i < cmd.length && /\s/.test(cmd[i]!)) i++;
-    if (i >= cmd.length) break;
-    const ch = cmd[i]!;
-    if (ch === '"') {
-      i++;
-      let arg = '';
-      while (i < cmd.length && cmd[i] !== '"') {
-        if (cmd[i] === '\\' && i + 1 < cmd.length) { i++; arg += cmd[i]; }
-        else { arg += cmd[i]; }
-        i++;
-      }
-      i++; // closing quote
-      result.push(arg);
-    } else if (ch === "'") {
-      i++;
-      let arg = '';
-      while (i < cmd.length && cmd[i] !== "'") { arg += cmd[i]; i++; }
-      i++; // closing quote
-      result.push(arg);
-    } else {
-      let arg = '';
-      while (i < cmd.length && !/\s/.test(cmd[i]!)) { arg += cmd[i]; i++; }
-      result.push(arg);
-    }
-  }
-  return result;
+  // 保留旧解析器对默认发现路径中 symlink 数据库的 include 行为；语义入口不会授权外部 DB。
+  return loadCompilationDatabase(projectRoot, undefined, true, true)?.includeDirectories ?? null;
 }
 
 /**

@@ -2,7 +2,7 @@
  * Project-scoped configuration: a committed `codegraph.json` at the project
  * root that a team shares through version control.
  *
- * Today it carries one thing — `extensions`, an opt-in map from a custom file
+ * It carries `extensions`, an opt-in map from a custom file
  * extension to one of CodeGraph's supported languages. The built-in
  * extension → language table (`EXTENSION_MAP` in `extraction/grammars.ts`) is
  * otherwise hardcoded, so a codebase that uses a non-standard extension for a
@@ -27,11 +27,14 @@ import * as path from 'path';
 import { Language } from './types';
 import { isLanguageSupported } from './extraction/grammars';
 import { logWarn } from './errors';
+import { findCompilationDatabase, isWithinProject } from './semantic/cpp/compile-database';
 
 /** Filename of the project-scoped config, resolved relative to the project root. */
 export const PROJECT_CONFIG_FILENAME = 'codegraph.json';
 
 export interface ProjectConfig {
+  /** 仅请求启用修复；仓库配置不能授权外部路径或可执行文件。 */
+  cppSemanticRepair?: { enabled: boolean; compileCommands?: string; mode?: 'union' };
   /** Map of custom file extension (`.foo`) to a supported language id. */
   extensions?: Record<string, string>;
   /**
@@ -86,6 +89,7 @@ export interface ProjectConfig {
 
 /** Parsed, validated view of a project's `codegraph.json`. */
 interface ParsedConfig {
+  cppSemanticRepair: CppSemanticRepairConfig | null;
   extensions: Record<string, Language>;
   includeIgnored: string[];
   exclude: string[];
@@ -109,6 +113,7 @@ const cache = new Map<string, CacheEntry>();
 /** Shared frozen empties so the no-config path allocates nothing. */
 const EMPTY_EXTENSIONS: Record<string, Language> = Object.freeze({});
 const EMPTY_CONFIG: ParsedConfig = Object.freeze({
+  cppSemanticRepair: null,
   extensions: EMPTY_EXTENSIONS,
   includeIgnored: Object.freeze([]) as unknown as string[],
   exclude: Object.freeze([]) as unknown as string[],
@@ -163,11 +168,13 @@ function parseConfig(file: string): ParsedConfig {
   if (!parsed || typeof parsed !== 'object') return EMPTY_CONFIG;
 
   const extensions = extractExtensions(parsed, file);
+  const cppSemanticRepair = extractCppSemanticRepair(parsed, file);
   const includeIgnored = extractIncludeIgnored(parsed, file);
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
   if (
+    cppSemanticRepair === null &&
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
@@ -176,7 +183,141 @@ function parseConfig(file: string): ParsedConfig {
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return { cppSemanticRepair, extensions, includeIgnored, exclude, include, deprioritize };
+}
+
+export interface CppSemanticRepairConfig {
+  enabled: true;
+  mode: 'union';
+  compileCommands?: string;
+}
+
+export interface CppSemanticRuntimeOptions {
+  /** undefined 使用 PATH 中的 clangd；null 表示显式但非法的路径，不可回退。 */
+  clangdPath: string | null | undefined;
+  queryDrivers: string[];
+  /** 仅来自用户侧授权，允许选择根目录外的编译数据库。 */
+  compileCommands?: string;
+}
+
+/**
+ * @brief 检验仓库语义修复配置，并排除所有仓库控制的执行授权。
+ * @param[in] parsed 已解析的配置对象
+ * @param[in] file 配置文件路径，用于诊断和定位项目根目录
+ * @return 验证后的 opt-in 配置；缺失、禁用或畸形时返回 null
+ */
+function extractCppSemanticRepair(parsed: object, file: string): CppSemanticRepairConfig | null {
+  const raw = (parsed as Record<string, unknown>).cppSemanticRepair;
+  if (raw === undefined) return null;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    logWarn('Ignoring cppSemanticRepair: expected an object', { file });
+    return null;
+  }
+  const obj = raw as Record<string, unknown>;
+  if (obj.enabled === false && Object.keys(obj).every(k => ['enabled', 'mode', 'compileCommands'].includes(k))) return null;
+  if (obj.enabled !== true || (obj.mode !== undefined && obj.mode !== 'union') ||
+      (obj.compileCommands !== undefined && (typeof obj.compileCommands !== 'string' || !obj.compileCommands.trim())) ||
+      Object.keys(obj).some(k => !['enabled', 'mode', 'compileCommands'].includes(k))) {
+    logWarn('Ignoring cppSemanticRepair: invalid fields or untrusted execution settings', { file });
+    return null;
+  }
+  const compileCommands = obj.compileCommands as string | undefined;
+  // 仓库选择的 DB 经 realpath 检验必须在真实项目根目录内；用户授权走独立入口。
+  if (compileCommands && !findCompilationDatabase(path.dirname(file), compileCommands)) {
+    logWarn('Ignoring cppSemanticRepair: compilation database is missing or outside project root', { file });
+    return null;
+  }
+  return { enabled: true, mode: 'union', ...(compileCommands ? { compileCommands } : {}) };
+}
+
+/**
+ * @brief 读取项目侧语义修复请求，不包含用户侧可执行文件授权。
+ * @param[in] rootDir 项目根目录
+ * @return 验证后的 opt-in 配置；禁用时返回 null
+ */
+export function loadCppSemanticRepairConfig(rootDir: string): CppSemanticRepairConfig | null {
+  return loadParsedConfig(rootDir).cppSemanticRepair;
+}
+
+/**
+ * @brief 解析仅来自 CLI 或环境变量的 clangd、驱动与外部数据库授权。
+ * @param[in] cli 显式用户选项，优先于环境变量
+ * @param[in] env 用户进程环境变量（默认当前进程环境）
+ * @param[in] projectRoot 项目根目录，用于防止 PATH 隐式选择项目内 clangd
+ * @return 验证后的运行时选项；非法 clangd 路径为 null 且不回退 PATH
+ */
+export function resolveCppSemanticRuntimeOptions(
+  cli: { clangdPath?: string; clangdQueryDrivers?: string; compileCommands?: string } = {},
+  env: NodeJS.ProcessEnv = process.env,
+  projectRoot?: string,
+): CppSemanticRuntimeOptions {
+  const rawPath = cli.clangdPath ?? env.CODEGRAPH_CLANGD_PATH;
+  let clangdPath: string | null | undefined;
+  if (rawPath !== undefined) {
+    if (rawPath === 'clangd') clangdPath = rawPath;
+    else if (rawPath.trim() && path.isAbsolute(rawPath)) {
+      try {
+        if (!fs.statSync(rawPath).isFile()) throw new Error('not a regular file');
+        fs.accessSync(rawPath, fs.constants.X_OK);
+        clangdPath = fs.realpathSync(rawPath);
+      } catch {
+        logWarn('Ignoring clangd path: executable is missing or not runnable');
+        clangdPath = null;
+      }
+    }
+    else {
+      logWarn('Ignoring untrusted clangd path: use an absolute path or clangd from PATH');
+      clangdPath = null;
+    }
+  }
+  if (projectRoot && (clangdPath === undefined || clangdPath === 'clangd')) {
+    const resolved = findPathClangd(env);
+    if (resolved) {
+      if (isWithinProject(fs.realpathSync(projectRoot), resolved)) {
+        logWarn('Ignoring clangd from PATH: executable resolves inside the project root');
+        clangdPath = null;
+      } else clangdPath = resolved;
+    } else {
+      logWarn('clangd not found in PATH; semantic repair executable is unavailable');
+      clangdPath = null;
+    }
+  }
+  const rawDrivers = cli.clangdQueryDrivers ?? env.CODEGRAPH_CLANGD_QUERY_DRIVERS;
+  let queryDrivers: string[] = [];
+  if (rawDrivers !== undefined) {
+    const drivers = rawDrivers.split(',').map(s => s.trim());
+    if (drivers.some(s => !s || !path.isAbsolute(s))) {
+      logWarn('Ignoring untrusted query-driver allowlist: every entry must be an absolute path');
+    } else queryDrivers = drivers;
+  }
+  const rawDb = cli.compileCommands ?? env.CODEGRAPH_COMPILE_COMMANDS;
+  let compileCommands: string | undefined;
+  if (rawDb !== undefined) {
+    const resolved = rawDb.trim() ? path.resolve(rawDb) : '';
+    try {
+      if (!resolved || !fs.statSync(resolved).isFile()) throw new Error('not a regular file');
+      compileCommands = fs.realpathSync(resolved);
+    } catch { logWarn('Ignoring invalid trusted compile-commands override'); }
+  }
+  return { clangdPath, queryDrivers, compileCommands };
+}
+
+/**
+ * @brief 找到 PATH 中首个实际可运行的 clangd，防止索引阶段改变 cwd 后重新解析。
+ * @param[in] env 用户进程环境变量
+ * @return 真实可执行文件路径；PATH 未找到时返回 undefined
+ */
+function findPathClangd(env: NodeJS.ProcessEnv): string | undefined {
+  if (env.PATH === undefined) return undefined;
+  for (const directory of env.PATH.split(path.delimiter)) {
+    const candidate = path.resolve(directory || '.', 'clangd');
+    try {
+      if (!fs.statSync(candidate).isFile()) continue;
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return fs.realpathSync(candidate);
+    } catch { /* 非可执行路径交由下一 PATH 分量处理。 */ }
+  }
+  return undefined;
 }
 
 /**

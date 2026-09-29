@@ -13,6 +13,7 @@ import { Node, UnresolvedReference } from '../src/types';
 import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
 import { matchReference, resolveMethodOnType, matchByQualifiedName, preferCallSiteFile, matchMethodCall } from '../src/resolution/name-matcher';
 import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef } from '../src/resolution/import-resolver';
+import { loadCompilationDatabase, compilationViewKey } from '../src/semantic/cpp/compile-database';
 import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
 import { QueryBuilder } from '../src/db/queries';
@@ -3512,6 +3513,67 @@ int run() {
       }
     });
 
+    it('retains duplicate commands, normalizes semantic flags and CMake output targets', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-variants-'));
+      try {
+        fs.mkdirSync(path.join(root, 'src'));
+        fs.writeFileSync(path.join(root, 'src', 'main.c'), 'int main(void) { return 0; }');
+        const output = 'build/CMakeFiles/USERPROC.dir/src/main.c.o';
+        fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify([
+          { directory: root, file: 'src/main.c', output, arguments: [
+            'cc', '-DA=1', '-I', 'include', '-isystem', '/usr/include', '--sysroot=/opt/sysroot',
+            '-std=c11', '-march=armv7', '-MMD', '-MF', 'build/main.d', '-o', output, '-c', 'src/main.c',
+          ] },
+          { directory: root, file: 'src/main.c', command: 'cc -DB="quoted value" -I"my headers" -o build/CMakeFiles/SYSCTRL.dir/main.o -c src/main.c' },
+          { directory: root, file: 'startup.S', arguments: ['cc', '-I', 'include', 'startup.S'] },
+        ]));
+        const db = loadCompilationDatabase(root)!;
+        expect(db.entries).toHaveLength(2);
+        expect(db.inventory).toBe('authoritative');
+        expect(db.entries.map(e => e.target)).toEqual(['USERPROC', 'SYSCTRL']);
+        expect(db.entries[0].semanticFlags).toEqual([
+          '-DA=1', '-I', 'include', '-isystem', '/usr/include', '--sysroot=/opt/sysroot', '-std=c11', '-march=armv7',
+        ]);
+        expect(compilationViewKey(db.entries[0])).not.toBe(compilationViewKey(db.entries[1]));
+        expect(db.entries[1].semanticFlags).toEqual(['-DB=quoted value', '-Imy headers']);
+        expect(db.includeDirectories).toEqual(['include', 'my headers']);
+        clearCppIncludeDirCache();
+        expect(loadCppIncludeDirs(root)).toEqual(db.includeDirectories);
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it('classifies flag-based grouping as advisory and keeps stable view keys', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-advisory-'));
+      try {
+        fs.writeFileSync(path.join(root, 'source.cpp'), '');
+        fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify([
+          { directory: root, file: 'source.cpp', arguments: ['c++', '-DTEST', 'source.cpp'] },
+          { directory: root, file: 'source.cpp', arguments: ['c++', '-DOTHER', 'source.cpp'] },
+        ]));
+        const first = loadCompilationDatabase(root)!;
+        expect(first.inventory).toBe('advisory');
+        expect(first.entries).toHaveLength(2);
+        const keys = first.entries.map(compilationViewKey);
+        expect(keys[0]).not.toBe(keys[1]);
+        expect(loadCompilationDatabase(root)!.entries.map(compilationViewKey)).toEqual(keys);
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it('marks conflicting commands for one source and CMake target advisory', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-target-'));
+      try {
+        fs.writeFileSync(path.join(root, 'source.c'), '');
+        fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify(['A', 'B'].map(define => ({
+          directory: root, file: 'source.c', output: 'CMakeFiles/app.dir/source.c.o',
+          arguments: ['cc', `-D${define}`, '-c', 'source.c'],
+        }))));
+        const db = loadCompilationDatabase(root)!;
+        expect(db.entries).toHaveLength(2);
+        expect(db.entries.map(e => e.target)).toEqual(['app', 'app']);
+        expect(db.inventory).toBe('advisory');
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    });
+
     it('should fall back to heuristic include dirs when no compile_commands.json', () => {
       const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-test-'));
       try {
@@ -3532,6 +3594,36 @@ int run() {
       } finally {
         fs.rmSync(tempProject, { recursive: true });
       }
+    });
+
+    it('keeps legacy include lookup through a standard-path external DB symlink', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-link-'));
+      const external = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-db-'));
+      try {
+        fs.writeFileSync(path.join(external, 'compile_commands.json'), JSON.stringify([
+          { directory: root, file: 'source.cpp', command: 'c++ -Iinclude -c source.cpp' },
+        ]));
+        fs.symlinkSync(path.join(external, 'compile_commands.json'), path.join(root, 'compile_commands.json'));
+        clearCppIncludeDirCache();
+        expect(loadCppIncludeDirs(root)).toEqual(['include']);
+        expect(loadCompilationDatabase(root)).toBeNull();
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(external, { recursive: true, force: true });
+      }
+    });
+
+    it('keeps include directories when an output field is malformed without claiming authority', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-malformed-'));
+      try {
+        fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify([
+          { directory: root, file: 'main.c', output: 42,
+            arguments: ['cc', '-Iinclude', '-o', 'CMakeFiles/app.dir/main.o', 'main.c'] },
+        ]));
+        clearCppIncludeDirCache();
+        expect(loadCppIncludeDirs(root)).toEqual(['include']);
+        expect(loadCompilationDatabase(root)?.inventory).toBe('advisory');
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
     });
 
     // Documents the cross-language `.h` behavior. Objective-C and C++ share
