@@ -11,6 +11,8 @@ export interface CompileCommandEntry {
   output?: string;
   semanticFlags: string[];
   target?: string;
+  /** 同一目标和 TU 有不同编译语义时，为各命令分配稳定子视图。 */
+  targetConflict?: boolean;
 }
 
 export interface CompilationDatabase {
@@ -27,6 +29,7 @@ const STANDARD_PATHS = [
   'cmake-build-debug/compile_commands.json', 'cmake-build-release/compile_commands.json',
   'out/compile_commands.json',
 ];
+const CPP_COMPILE_EXTENSIONS = new Set(['.c', '.cc', '.cpp', '.cxx', '.c++', '.i', '.ii', '.h', '.hh', '.hpp', '.hxx']);
 
 /**
  * @brief 判定规范化路径是否位于项目根目录内。
@@ -134,7 +137,7 @@ export function normalizeSemanticFlags(args: string[], source: string, directory
       if (i + 1 < args.length) flags.push(arg, args[++i]!);
       continue;
     }
-    if (/^(-[DUIF].+|-isystem.+|-isysroot.+|-iquote.+|-idirafter.+|-include.+|-imacros.+|-iframework.+|--?sysroot=.+|-std=.+|-stdlib=.+|--?target=.+|-m(?:arch|cpu|tune|abi)=.+|-m[A-Za-z0-9_-]+|-f[A-Za-z0-9_-]+(?:=.+)?|-nostdinc\+*|-pthread)$/.test(arg)) flags.push(arg);
+    if (arg === '-ansi' || /^(-[DUIF].+|-isystem.+|-isysroot.+|-iquote.+|-idirafter.+|-include.+|-imacros.+|-iframework.+|--?sysroot=.+|-std=.+|-stdlib=.+|--?target=.+|-m(?:arch|cpu|tune|abi)=.+|-m[A-Za-z0-9_-]+|-f[A-Za-z0-9_-]+(?:=.+)?|-nostdinc\+*|-pthread)$/.test(arg)) flags.push(arg);
   }
   return flags;
 }
@@ -154,8 +157,9 @@ export function cmakeTargetFromOutput(output?: string): string | undefined {
  * @return CMake 目标或语义参数散列构成的稳定标识
  */
 export function compilationViewKey(entry: CompileCommandEntry): string {
-  if (entry.target) return `cmake:${entry.target}`;
-  return `flags:${createHash('sha256').update(JSON.stringify([entry.compiler, entry.directory, entry.semanticFlags])).digest('hex').slice(0, 16)}`;
+  if (entry.target && !entry.targetConflict) return `cmake:${entry.target}`;
+  const hash = createHash('sha256').update(JSON.stringify([entry.compiler, entry.directory, entry.semanticFlags])).digest('hex').slice(0, 16);
+  return entry.target ? `cmake:${entry.target}:${hash}` : `flags:${hash}`;
 }
 
 /**
@@ -179,6 +183,7 @@ export function loadCompilationDatabase(projectRoot: string, explicitPath?: stri
     if (!Array.isArray(raw)) return null;
     const entries: CompileCommandEntry[] = [];
     const includes = new Set<string>();
+    const includeRoot = includeOnly ? path.resolve(projectRoot) : root;
     let excludedSources = 0;
     let incompleteCommands = 0;
     for (const item of raw) {
@@ -188,7 +193,8 @@ export function loadCompilationDatabase(projectRoot: string, explicitPath?: stri
       if (row.command !== undefined && typeof row.command !== 'string') return null;
       if (row.arguments !== undefined && (!Array.isArray(row.arguments) || !row.arguments.every(a => typeof a === 'string'))) return null;
       const malformedOutput = row.output !== undefined && typeof row.output !== 'string';
-      const directoryPath = path.resolve(path.dirname(dbPath), (row.directory as string) || root);
+      const directoryPath = path.resolve(path.dirname(dbPath), (row.directory as string) || includeRoot);
+      const directory = includeOnly ? null : canonicalizePotentialPath(directoryPath);
       const args = Array.isArray(row.arguments) ? row.arguments as string[] : typeof row.command === 'string' ? splitCompileCommand(row.command) : [];
       // include 搜索沿用旧行为：数据库中的外部 TU 仍可贡献项目内头目录。
       for (let i = 0; i < args.length; i++) {
@@ -197,19 +203,21 @@ export function loadCompilationDatabase(projectRoot: string, explicitPath?: stri
         if (arg.startsWith('-I') && arg.length > 2) includeDir = arg.slice(2);
         else if ((arg === '-isystem' || arg === '-I') && i + 1 < args.length) includeDir = args[++i];
         if (includeDir) {
-          const rel = path.relative(root, path.resolve(directoryPath, includeDir)).replace(/\\/g, '/');
+          // include-only 保持旧 resolver 的词法坐标；语义模型则在真实路径坐标内计算。
+          const rel = path.relative(includeRoot, path.resolve(directory ?? directoryPath, includeDir)).replace(/\\/g, '/');
           if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) includes.add(rel);
         }
       }
       if (includeOnly) continue;
-      const directory = canonicalizePotentialPath(directoryPath);
       if (!directory || typeof row.file !== 'string' || !row.file.trim()) {
         incompleteCommands++;
         continue;
       }
       const sourcePath = path.resolve(directory, row.file);
-      // 非 C/C++ 编译项（例如汇编）不参与 C/C++ 的完整性证明。
-      if (!/\.(?:c|C|cc|cpp|cxx|c\+\+|i|ii|h|hh|hpp|hxx)$/.test(sourcePath)) continue;
+      // 扩展名按 grammar 的大小写规则归一；显式 -x 也可指定非常规后缀 TU。
+      const forcedCpp = args.some((arg, i) =>
+        /^(?:c|c\+\+)(?:-header)?$/.test(arg === '-x' ? args[i + 1] ?? '' : arg.startsWith('-x') ? arg.slice(2) : ''));
+      if (!CPP_COMPILE_EXTENSIONS.has(path.extname(sourcePath).toLowerCase()) && !forcedCpp) continue;
       if (malformedOutput) incompleteCommands++;
       if (!args.length) { incompleteCommands++; continue; }
       // 现存符号链接必须使用真实目标；未生成的 TU 仅使用词法路径。
@@ -223,16 +231,21 @@ export function loadCompilationDatabase(projectRoot: string, explicitPath?: stri
     }
     // 同一 CMake 目标若为同一源文件给出不同宏环境，单个视图无法证明完整覆盖。
     const targetCommands = new Map<string, string>();
-    let conflictingTarget = false;
+    const conflictingTargetFiles = new Set<string>();
     for (const entry of entries) {
       if (!entry.target) continue;
       const key = JSON.stringify([entry.target, entry.file]);
       const signature = JSON.stringify([entry.compiler, entry.directory, entry.semanticFlags]);
-      if (targetCommands.has(key) && targetCommands.get(key) !== signature) conflictingTarget = true;
+      if (targetCommands.has(key) && targetCommands.get(key) !== signature) conflictingTargetFiles.add(key);
       targetCommands.set(key, signature);
     }
+    for (const entry of entries) {
+      if (entry.target && conflictingTargetFiles.has(JSON.stringify([entry.target, entry.file]))) {
+        entry.targetConflict = true;
+      }
+    }
     const allTargets = entries.every(entry => entry.target !== undefined);
-    const authoritative = entries.length > 0 && incompleteCommands === 0 && allTargets && !conflictingTarget;
+    const authoritative = entries.length > 0 && incompleteCommands === 0 && allTargets && conflictingTargetFiles.size === 0;
     return { path: dbPath, entries, includeDirectories: [...includes], excludedSources,
       inventory: authoritative ? 'authoritative' : 'advisory', grouping: allTargets ? 'cmake-target' : 'semantic-flags' };
   } catch { return null; }

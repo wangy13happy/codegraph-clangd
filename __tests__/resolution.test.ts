@@ -3563,14 +3563,68 @@ int run() {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-target-'));
       try {
         fs.writeFileSync(path.join(root, 'source.c'), '');
-        fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify(['A', 'B'].map(define => ({
+        fs.writeFileSync(path.join(root, 'helper.c'), '');
+        const variants = ['A', 'B'].map(define => ({
           directory: root, file: 'source.c', output: 'CMakeFiles/app.dir/source.c.o',
           arguments: ['cc', `-D${define}`, '-c', 'source.c'],
-        }))));
+        }));
+        const helper = { directory: root, file: 'helper.c', output: 'CMakeFiles/app.dir/helper.c.o',
+          arguments: ['cc', '-c', 'helper.c'] };
+        const commands = [...variants, variants[0], helper];
+        fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify(commands));
         const db = loadCompilationDatabase(root)!;
-        expect(db.entries).toHaveLength(2);
-        expect(db.entries.map(e => e.target)).toEqual(['app', 'app']);
+        expect(db.entries).toHaveLength(4);
+        expect(db.entries.map(e => e.target)).toEqual(['app', 'app', 'app', 'app']);
         expect(db.inventory).toBe('advisory');
+        const keys = db.entries.map(compilationViewKey);
+        expect(keys[0]).not.toBe(keys[1]);
+        expect(keys[0]).toBe(keys[2]);
+        expect(keys[3]).toBe('cmake:app');
+        fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify([...commands].reverse()));
+        expect(loadCompilationDatabase(root)!.entries.map(compilationViewKey).reverse()).toEqual(keys);
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it('keeps uppercase C++ translation units in the inventory and coverage classification', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-uppercase-'));
+      try {
+        fs.writeFileSync(path.join(root, 'plain.c'), '');
+        fs.writeFileSync(path.join(root, 'upper.CPP'), '');
+        const base = { directory: root, file: 'plain.c', output: 'CMakeFiles/app.dir/plain.c.o',
+          arguments: ['cc', '-c', 'plain.c'] };
+        const upper = { directory: root, file: 'upper.CPP',
+          arguments: ['c++', '-c', 'upper.CPP'] };
+        fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify([base, upper]));
+        const advisory = loadCompilationDatabase(root)!;
+        expect(advisory.entries.map(e => e.file)).toEqual(['plain.c', 'upper.CPP']);
+        expect(advisory.inventory).toBe('advisory');
+        fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify([
+          base, { ...upper, output: 'CMakeFiles/app.dir/upper.CPP.o' },
+        ]));
+        expect(loadCompilationDatabase(root)!.inventory).toBe('authoritative');
+        fs.writeFileSync(path.join(root, 'forced.custom'), '');
+        fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify([
+          base, { directory: root, file: 'forced.custom',
+            arguments: ['c++', '-x', 'c++', '-c', 'forced.custom'] },
+        ]));
+        expect(loadCompilationDatabase(root)!.entries.map(e => e.file)).toEqual(['plain.c', 'forced.custom']);
+        expect(loadCompilationDatabase(root)!.inventory).toBe('advisory');
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    });
+
+    it('separates strict ANSI and default compile commands into stable fallback views', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-ansi-'));
+      try {
+        fs.writeFileSync(path.join(root, 'source.c'), '');
+        const commands = [[], ['-ansi']].map(flags => ({ directory: root, file: 'source.c',
+          arguments: ['cc', ...flags, '-c', 'source.c'] }));
+        fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify(commands));
+        const db = loadCompilationDatabase(root)!;
+        expect(db.entries.map(e => e.semanticFlags)).toEqual([[], ['-ansi']]);
+        const keys = db.entries.map(compilationViewKey);
+        expect(keys[0]).not.toBe(keys[1]);
+        fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify([...commands].reverse()));
+        expect(loadCompilationDatabase(root)!.entries.map(compilationViewKey).reverse()).toEqual(keys);
       } finally { fs.rmSync(root, { recursive: true, force: true }); }
     });
 
@@ -3610,6 +3664,29 @@ int run() {
       } finally {
         fs.rmSync(root, { recursive: true, force: true });
         fs.rmSync(external, { recursive: true, force: true });
+      }
+    });
+
+    it('keeps default include lookup when the project root is a symlink', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-real-root-'));
+      const links = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-root-links-'));
+      const linkedRoot = path.join(links, 'project');
+      try {
+        fs.symlinkSync(root, linkedRoot, 'dir');
+        fs.mkdirSync(path.join(root, 'src'));
+        fs.writeFileSync(path.join(root, 'src', 'source.c'), '');
+        fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify([{
+          directory: linkedRoot, file: 'src/source.c',
+          arguments: ['cc', '-Iinclude', '-c', 'src/source.c'],
+        }]));
+        clearCppIncludeDirCache();
+        expect(loadCppIncludeDirs(linkedRoot)).toEqual(['include']);
+        const db = loadCompilationDatabase(linkedRoot)!;
+        expect(db.entries.map(e => e.file)).toEqual(['src/source.c']);
+        expect(db.includeDirectories).toEqual(['include']);
+      } finally {
+        fs.rmSync(links, { recursive: true, force: true });
+        fs.rmSync(root, { recursive: true, force: true });
       }
     });
 
