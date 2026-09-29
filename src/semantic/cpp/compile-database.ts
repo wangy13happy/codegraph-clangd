@@ -137,7 +137,7 @@ export function normalizeSemanticFlags(args: string[], source: string, directory
       if (i + 1 < args.length) flags.push(arg, args[++i]!);
       continue;
     }
-    if (arg === '-ansi' || /^(-[DUIF].+|-isystem.+|-isysroot.+|-iquote.+|-idirafter.+|-include.+|-imacros.+|-iframework.+|--?sysroot=.+|-std=.+|-stdlib=.+|--?target=.+|-m(?:arch|cpu|tune|abi)=.+|-m[A-Za-z0-9_-]+|-f[A-Za-z0-9_-]+(?:=.+)?|-nostdinc\+*|-pthread)$/.test(arg)) flags.push(arg);
+    if (arg === '-ansi' || (arg.startsWith('-x') && arg.length > 2) || /^(-[DUIF].+|-isystem.+|-isysroot.+|-iquote.+|-idirafter.+|-include.+|-imacros.+|-iframework.+|--?sysroot=.+|-std=.+|-stdlib=.+|--?target=.+|-m(?:arch|cpu|tune|abi)=.+|-m[A-Za-z0-9_-]+|-f[A-Za-z0-9_-]+(?:=.+)?|-nostdinc\+*|-pthread)$/.test(arg)) flags.push(arg);
   }
   return flags;
 }
@@ -214,10 +214,18 @@ export function loadCompilationDatabase(projectRoot: string, explicitPath?: stri
         continue;
       }
       const sourcePath = path.resolve(directory, row.file);
-      // 扩展名按 grammar 的大小写规则归一；显式 -x 也可指定非常规后缀 TU。
-      const forcedCpp = args.some((arg, i) =>
-        /^(?:c|c\+\+)(?:-header)?$/.test(arg === '-x' ? args[i + 1] ?? '' : arg.startsWith('-x') ? arg.slice(2) : ''));
-      if (!CPP_COMPILE_EXTENSIONS.has(path.extname(sourcePath).toLowerCase()) && !forcedCpp) continue;
+      // -x 仅影响它后面的源文件；后续模式覆盖前序模式，none 恢复按扩展名判断。
+      let languageOverride: string | null = null;
+      for (let i = 1; i < args.length; i++) {
+        const arg = args[i]!;
+        if (!arg.startsWith('-') && path.resolve(directory, arg) === sourcePath) break;
+        const language = arg === '-x' ? args[++i] : arg.startsWith('-x') ? arg.slice(2) : undefined;
+        if (language !== undefined) languageOverride = language === 'none' ? null : language;
+      }
+      const isCpp = languageOverride === null
+        ? CPP_COMPILE_EXTENSIONS.has(path.extname(sourcePath).toLowerCase())
+        : /^(?:c|c\+\+)(?:-header)?$/.test(languageOverride);
+      if (!isCpp) continue;
       if (malformedOutput) incompleteCommands++;
       if (!args.length) { incompleteCommands++; continue; }
       // 现存符号链接必须使用真实目标；未生成的 TU 仅使用词法路径。

@@ -3612,6 +3612,33 @@ int run() {
       } finally { fs.rmSync(root, { recursive: true, force: true }); }
     });
 
+    it('uses the final -x mode effective for each translation unit', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-language-'));
+      try {
+        const cases: Array<[string, string[]]> = [
+          ['plain.c', ['cc', '-c', 'plain.c']],
+          ['startup.S', ['cc', '-x', 'c++', '-x', 'assembler-with-cpp', '-c', 'startup.S']],
+          ['reset.S', ['cc', '-xc++', '-x', 'none', '-c', 'reset.S']],
+          ['assembly.c', ['cc', '-x', 'assembler-with-cpp', '-c', 'assembly.c']],
+          ['reset.c', ['cc', '-x', 'assembler-with-cpp', '-xnone', '-c', 'reset.c']],
+          ['forced.custom', ['cc', '-x', 'assembler-with-cpp', '-xc++', '-c', 'forced.custom']],
+          ['prior.custom', ['cc', '-xc++', '-c', 'prior.custom', '-x', 'assembler-with-cpp']],
+        ];
+        const rows = cases.map(([file, args]) => {
+          fs.writeFileSync(path.join(root, file), '');
+          return { directory: root, file, output: `CMakeFiles/app.dir/${file}.o`, arguments: args };
+        });
+        fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify(rows));
+        const db = loadCompilationDatabase(root)!;
+        expect(db.entries.map(e => e.file)).toEqual(['plain.c', 'reset.c', 'forced.custom', 'prior.custom']);
+        expect(db.inventory).toBe('authoritative');
+        expect(db.entries.find(e => e.file === 'forced.custom')?.semanticFlags)
+          .toEqual(['-x', 'assembler-with-cpp', '-xc++']);
+        expect(db.entries.find(e => e.file === 'reset.c')?.semanticFlags)
+          .toEqual(['-x', 'assembler-with-cpp', '-xnone']);
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    });
+
     it('separates strict ANSI and default compile commands into stable fallback views', () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-ansi-'));
       try {
