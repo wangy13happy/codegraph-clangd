@@ -94,6 +94,23 @@ describe('C/C++ semantic fact collector', () => {
     }
   });
 
+  it('samples only views containing a changed implementation while retaining the complete view inventory', async () => {
+    const db = database([entry('variant.c', 'one', ['-DVARIANT_ONE']),
+      entry('static-a.c', 'one'), entry('static-b.c', 'two')]);
+    const compileViews = buildCompileViews(db);
+    const selected = compileViews.find(view => view.key === 'cmake:one')!;
+    const skipped = compileViews.find(view => view.key === 'cmake:two')!;
+    const result = await collectCppSemanticFacts(root, db,
+      { clangdPath: executable, queryDrivers: [] }, { scopeFiles: ['variant.c'] });
+    expect(result.views.map(view => view.id)).toEqual([selected.id]);
+    expect(result.views[0]?.coveredFiles).toEqual(['static-a.c', 'variant.c']);
+    expect(result.expectedViewsByFile).toMatchObject({
+      'variant.c': [selected.id], 'static-a.c': [selected.id], 'static-b.c': [skipped.id],
+    });
+    expect(result.symbols.some(symbol => symbol.filePath === 'static-b.c')).toBe(false);
+    expect(fs.existsSync(path.join(root, '.codegraph', 'semantic', 'compile-db', skipped.id))).toBe(false);
+  });
+
   it('classifies conflicting target/TU commands and fallback grouping as non-destructive advisory', () => {
     const db = database([entry('variant.c', 'same', ['-DVARIANT_ONE']),
       entry('variant.c', 'same', ['-DVARIANT_TWO']),

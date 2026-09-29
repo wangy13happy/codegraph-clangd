@@ -34,7 +34,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { isSourceFile, buildScopeIgnore, type ScopeIgnore } from '../extraction';
-import { loadExtensionOverrides, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { loadExtensionOverrides, loadCppSemanticRepairConfig, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { findCompilationDatabase } from '../semantic/cpp/compile-database';
 import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
 import { isCodeGraphDataDir } from '../directory';
@@ -265,6 +266,8 @@ export class FileWatcher {
   private recursiveWatcher: fs.FSWatcher | null = null;
   /** Linux: one watcher per watched directory (keyed by absolute path). */
   private dirWatchers = new Map<string, fs.FSWatcher>();
+  /** Linux 下被普通源码忽略策略跳过的编译数据库目录，至多额外监听一个。 */
+  private compileDatabaseWatcher: fs.FSWatcher | null = null;
   /** Set once the per-directory watch cap is hit, so we log only once. */
   private dirCapWarned = false;
   /**
@@ -392,6 +395,7 @@ export class FileWatcher {
       } else {
         this.startPerDirectory();
       }
+      if (!this.inertForTests) this.refreshCompilationDatabaseWatch();
 
       // The per-directory (Linux) path catches watch-resource exhaustion inside
       // watchTree and degrades synchronously rather than throwing, so it never
@@ -582,6 +586,15 @@ export class FileWatcher {
       this.refreshScope(rel);
       return;
     }
+    const repair = loadCppSemanticRepairConfig(this.projectRoot);
+    if (repair && (repair.compileCommands
+      ? rel === normalizePath(path.relative(this.projectRoot, path.resolve(this.projectRoot, repair.compileCommands)))
+      : path.basename(rel) === 'compile_commands.json')) {
+      // 编译数据库不是源码；仍需调度无源码变化的全图扫描，让指纹驱动修复。
+      this.needsFullScan = true;
+      this.scheduleSync();
+      return;
+    }
     if (this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
     // A nested `.gitignore` (an embedded child repo's own rules, #514, or a
     // subdirectory rule the git-backed full scan honors) is only a scope
@@ -634,8 +647,39 @@ export class FileWatcher {
   private refreshScope(rel: string): void {
     logDebug('Scope config changed; rebuilding watcher scope', { file: rel });
     this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
+    if (!this.inertForTests) this.refreshCompilationDatabaseWatch();
     this.needsFullScan = true;
     this.scheduleSync();
+  }
+
+  /**
+   * @brief Linux 源码忽略目录内的编译数据库单独建立有界目录监听。
+   * @return 无；监听不可用时保留手动 sync 与 status 指纹检查作为后备
+   */
+  private refreshCompilationDatabaseWatch(): void {
+    this.compileDatabaseWatcher?.close();
+    this.compileDatabaseWatcher = null;
+    if (supportsRecursiveWatch()) return;
+    const config = loadCppSemanticRepairConfig(this.projectRoot);
+    if (!config) return;
+    const database = findCompilationDatabase(this.projectRoot, config.compileCommands);
+    if (!database || this.dirWatchers.has(path.dirname(database))) return;
+    try {
+      this.compileDatabaseWatcher = watchImpl(path.dirname(database), (_event, filename) => {
+        if (!this.stopped && filename != null && String(filename) === path.basename(database)) {
+          this.handleChange(normalizePath(path.relative(this.projectRoot, database)));
+        }
+      });
+      this.compileDatabaseWatcher.on('error', error => {
+        logWarn('Compilation database watcher unavailable; use codegraph sync for freshness',
+          { error: String(error) });
+        this.compileDatabaseWatcher?.close();
+        this.compileDatabaseWatcher = null;
+      });
+    } catch (error) {
+      logWarn('Compilation database watcher unavailable; use codegraph sync for freshness',
+        { error: String(error) });
+    }
   }
 
   /**
@@ -769,6 +813,8 @@ export class FileWatcher {
       }
       this.recursiveWatcher = null;
     }
+    this.compileDatabaseWatcher?.close();
+    this.compileDatabaseWatcher = null;
     for (const w of this.dirWatchers.values()) {
       try {
         w.close();

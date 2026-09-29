@@ -112,6 +112,35 @@ describe('codegraph index — full re-index keeps the graph populated (#874)', (
     expect(afterIndex.nodes).toBe(afterInit.nodes);
     expect(afterIndex.edges).toBe(afterInit.edges);
   });
+
+  it('reports semantic failure independently of ordinary index completion in JSON and text', () => {
+    fs.writeFileSync(path.join(tempDir, 'codegraph.json'), JSON.stringify({ cppSemanticRepair: { enabled: true } }));
+    runCodegraph(['init'], tempDir);
+    const status = JSON.parse(runCodegraph(['status', '--json'], tempDir));
+    expect(status.index.state).toBe('complete');
+    expect(status.cppSemanticRepair).toMatchObject({ state: 'failed', clangdVersion: null,
+      viewCount: 0, translationUnits: 0, nodesAdded: 0, callsAdded: 0,
+      callsRepositioned: 0, viewsFailed: 0 });
+    expect(status.cppSemanticRepair.reason).toContain('no compilation database');
+    expect(runCodegraph(['status'], tempDir)).toContain('C/C++ semantic repair: failed');
+  });
+
+  it.skipIf(!fs.existsSync('/usr/bin/clangd-19'))('uses trusted status options to report the current semantic repair state', () => {
+    fs.writeFileSync(path.join(tempDir, 'codegraph.json'), JSON.stringify({ cppSemanticRepair: { enabled: true } }));
+    fs.writeFileSync(path.join(tempDir, 'sample.c'), 'int sample(void) { return 1; }\n');
+    fs.writeFileSync(path.join(tempDir, 'compile_commands.json'), JSON.stringify([{
+      directory: tempDir, file: 'sample.c', arguments: ['cc', '-c', 'sample.c'],
+      output: 'CMakeFiles/sample.dir/sample.c.o',
+    }]));
+    runCodegraph(['init'], tempDir);
+    runCodegraph(['sync', '--clangd-path', '/usr/bin/clangd-19'], tempDir);
+    const current = JSON.parse(runCodegraph(['status', '--json', '--clangd-path', '/usr/bin/clangd-19'], tempDir));
+    expect(current.index.state).toBe('complete');
+    expect(current.cppSemanticRepair).toMatchObject({ state: 'complete', viewCount: 1, viewsFailed: 0 });
+    expect(current.cppSemanticRepair.clangdVersion).toMatch(/^19(?:\.|$)/);
+    const unavailable = JSON.parse(runCodegraph(['status', '--json', '--clangd-path', '/not/a/clangd'], tempDir));
+    expect(unavailable.cppSemanticRepair).toMatchObject({ state: 'failed' });
+  });
 });
 
 /**

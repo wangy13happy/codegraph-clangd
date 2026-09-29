@@ -71,7 +71,21 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
     throw new Error('Invalid C/C++ semantic view inventory');
   }
   for (const fact of collection.symbols) validateFact(fact, ids);
-  const complete = hasAuthoritativeCoverage(collection);
+  const complete = !collection.scopeFiles && hasAuthoritativeCoverage(collection);
+  const scoped = new Set(collection.scopeFiles ?? []);
+  /**
+   * @brief 仅当目标文件在所有关联视图均成功覆盖时允许撤销旧归属。
+   * @param[in] file 项目相对源码文件路径
+   * @return 当前清单足以对该文件提供负面证据时为 true
+   */
+  const canRefresh = (file: string): boolean => {
+    if (complete) return true;
+    if (!collection.scopeFiles || collection.inventory !== 'authoritative' || !scoped.has(file)) return false;
+    const expected = collection.expectedViewsByFile?.[file] ?? [];
+    return expected.length > 0 && expected.every(id => collection.views.some(view =>
+      view.id === id && view.inventory === 'authoritative' && view.success &&
+      view.failedFiles.length === 0 && view.coveredFiles.includes(file)));
+  };
   const sorted = [...collection.symbols].sort((a, b) =>
     a.filePath.localeCompare(b.filePath) || a.kind.localeCompare(b.kind) ||
     a.name.localeCompare(b.name) || a.startLine - b.startLine ||
@@ -98,9 +112,10 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
           authority=excluded.authority, metadata=excluded.metadata, updated_at=excluded.updated_at
       `).run(view.id, view.key, view.compiler ?? null, view.flagsHash,
         authority, JSON.stringify({ grouping: view.grouping }), now);
-      if (!complete || !view.success) continue;
+      if (!view.success) continue;
       // 单视图只提供其真正覆盖文件的负面证据；其他文件即使未出现也保留。
       for (const file of view.coveredFiles) {
+        if (!canRefresh(file)) continue;
         db.prepare(`
           DELETE FROM semantic_node_configs WHERE config_id = ?
             AND node_id IN (SELECT id FROM nodes WHERE file_path = ?)
@@ -160,16 +175,19 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
           definition_col=excluded.definition_col
       `).run(winner.id, fact.configId, fact.signature ?? null, fact.startLine, fact.startColumn);
     }
-    if (complete) {
+    if (complete || [...scoped].some(canRefresh)) {
       // 只有语义创建且已无任何配置归属的身份可以删除；基线与 heuristic 边不受影响。
       for (const row of db.prepare(`
         SELECT id FROM nodes WHERE semantic_origin = 'clangd'
           AND NOT EXISTS (SELECT 1 FROM semantic_node_configs WHERE node_id = nodes.id)
-      `).all() as Array<{ id: string }>) queries.deleteNode(row.id);
-      db.prepare(`
-        DELETE FROM edges WHERE provenance = 'clangd'
-          AND NOT EXISTS (SELECT 1 FROM semantic_edge_configs WHERE edge_id = edges.id)
-      `).run();
+      `).all() as Array<{ id: string }>) {
+        const node = queries.getNodeById(row.id);
+        if (node && canRefresh(node.filePath)) queries.deleteNode(row.id);
+      }
+      if (complete) db.prepare(`
+          DELETE FROM edges WHERE provenance = 'clangd'
+            AND NOT EXISTS (SELECT 1 FROM semantic_edge_configs WHERE edge_id = edges.id)
+        `).run();
     }
   })();
   used.retryNames = [...retryNames].sort();

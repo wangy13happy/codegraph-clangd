@@ -54,9 +54,8 @@ import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
-import { loadDeprioritizePatterns, loadCppSemanticRepairConfig, resolveCppSemanticRuntimeOptions } from './project-config';
-import { loadCompilationDatabase } from './semantic/cpp/compile-database';
-import { collectCppSemanticFacts } from './semantic/cpp';
+import { loadDeprioritizePatterns } from './project-config';
+import { collectCppSemanticFacts, resolveCppSemanticInputs, CppSemanticInputs } from './semantic/cpp';
 import { reconcileCppSemanticNodes } from './semantic/cpp/reconciler';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
@@ -134,6 +133,19 @@ export interface IndexOptions {
   verbose?: boolean;
   /** Watcher fast path: reconcile ONLY these project-relative paths (see ExtractionOrchestrator.sync). */
   paths?: string[];
+}
+
+export interface CppSemanticRepairStatus {
+  state: 'complete' | 'partial' | 'stale' | 'failed';
+  clangdVersion: string | null;
+  viewCount: number;
+  translationUnits: number;
+  nodesAdded: number;
+  callsAdded: number;
+  callsRepositioned: number;
+  viewsFailed: number;
+  durationMs: number;
+  reason?: string;
 }
 
 /**
@@ -467,6 +479,51 @@ export class CodeGraph {
   // ===========================================================================
 
   /**
+   * @brief 在普通引用解析后修复语义节点、重试失败引用并修复直接调用。
+   * @param[in] inputs 当前可信编译数据库、工具版本与输入指纹
+   * @param[in] scopeFiles 定向同步的变更实现文件；省略时采集权威全量清单
+   * @param[in] signal 可选索引取消信号
+   * @return 本轮修复状态；单个视图失败保留正向证据但不推进成功指纹
+   */
+  private async repairCppSemantics(inputs: CppSemanticInputs, scopeFiles?: string[],
+    signal?: AbortSignal): Promise<CppSemanticRepairStatus> {
+    const started = Date.now();
+    const status: CppSemanticRepairStatus = { state: 'failed', clangdVersion: inputs.clangdVersion,
+      viewCount: 0, translationUnits: 0, nodesAdded: 0, callsAdded: 0,
+      callsRepositioned: 0, viewsFailed: 0, durationMs: 0 };
+    try {
+      if (inputs.error || !inputs.database || !inputs.fingerprint) throw new Error(inputs.error ?? 'semantic inputs unavailable');
+      const facts = await collectCppSemanticFacts(this.projectRoot, inputs.database, inputs.runtime,
+        { scopeFiles, signal });
+      status.viewCount = facts.views.length;
+      status.translationUnits = facts.views.reduce((total, view) => total + view.analyzedTuCount, 0);
+      status.viewsFailed = facts.views.filter(view => !view.success).length;
+      const missingScopedViews = !!scopeFiles && scopeFiles.some(file =>
+        (facts.expectedViewsByFile?.[file] ?? []).some(id => !facts.views.some(view =>
+          view.id === id && view.success && view.coveredFiles.includes(file))));
+      const repaired = reconcileCppSemanticNodes(this.db.getDb(), this.queries, facts);
+      status.nodesAdded = repaired.nodesAdded;
+      this.resolver.clearCaches();
+      const retryable = this.queries.getRetryableFailedReferences(repaired.retryNames);
+      if (retryable.length) await this.resolver.resolveAndPersistListYielding(retryable);
+      const edges = this.queries.reconcileCppSemanticCalls(facts,
+        count => { status.callsRepositioned = count; });
+      status.callsAdded = edges.added;
+      status.state = status.viewsFailed || missingScopedViews ? 'partial' : 'complete';
+      this.queries.setMetadata('semantic_repair_attempt_fingerprint', inputs.fingerprint);
+      if (status.state === 'complete') this.queries.setMetadata('semantic_repair_fingerprint', inputs.fingerprint);
+      else status.reason = missingScopedViews ? 'targeted view coverage incomplete' :
+        `${status.viewsFailed} compilation views failed`;
+    } catch (error) {
+      status.reason = String(error);
+    }
+    status.durationMs = Date.now() - started;
+    try { this.queries.setMetadata('semantic_repair_status', JSON.stringify(status)); }
+    catch { /* 语义诊断不可用不能使普通索引失败。 */ }
+    return status;
+  }
+
+  /**
    * Index all files in the project
    *
    * Uses a mutex to prevent concurrent indexing operations.
@@ -626,13 +683,8 @@ export class CodeGraph {
             total: unresolvedCount,
           });
 
-          const semanticConfig = loadCppSemanticRepairConfig(this.projectRoot);
-          const semanticRuntime = semanticConfig ? resolveCppSemanticRuntimeOptions({}, process.env, this.projectRoot) : null;
-          const semanticDatabase = semanticConfig && semanticRuntime?.clangdPath
-            ? loadCompilationDatabase(this.projectRoot,
-              semanticRuntime.compileCommands ?? semanticConfig.compileCommands, !!semanticRuntime.compileCommands)
-            : null;
-          const semanticEnabled = !!semanticDatabase?.entries.length;
+          const semanticInputs = resolveCppSemanticInputs(this.projectRoot);
+          const semanticEnabled = !!semanticInputs?.fingerprint;
           const tResolve = Date.now();
           await this.resolveReferencesBatched(
             (current, total) => {
@@ -654,24 +706,18 @@ export class CodeGraph {
           );
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolution: ${Date.now() - tResolve}ms`);
 
-          if (semanticEnabled) {
+          if (semanticInputs) {
             try {
-              const facts = await collectCppSemanticFacts(this.projectRoot, semanticDatabase!, semanticRuntime!,
-                { signal: options.signal });
-              const repaired = reconcileCppSemanticNodes(this.db.getDb(), this.queries, facts);
-              // 基础解析预热了名称/节点缓存；新增语义身份必须在重试前可见。
-              this.resolver.clearCaches();
-              const retryable = this.queries.getRetryableFailedReferences(repaired.retryNames);
-              if (retryable.length) await this.resolver.resolveAndPersistListYielding(retryable);
-              this.queries.reconcileCppSemanticCalls(facts);
-            } catch (error) {
-              // 语义修复不影响普通索引完成，但采集/对账失败不能提供删除证据。
-              result.errors.push({ message: `C/C++ semantic repair failed: ${String(error)}`, severity: 'warning' });
+              const status = await this.repairCppSemantics(semanticInputs, undefined, options.signal);
+              if (status.state !== 'complete') result.errors.push({
+                message: `C/C++ semantic repair ${status.state}: ${status.reason}`, severity: 'warning' });
             } finally {
-              await this.resolver.synthesizeDynamicEdges(
-                (done, total) => options.onProgress?.({ phase: 'linking', current: done, total }),
-                walValve ? () => walValve!.backpressure() : undefined
-              );
+              if (semanticEnabled) {
+                await this.resolver.synthesizeDynamicEdges(
+                  (done, total) => options.onProgress?.({ phase: 'linking', current: done, total }),
+                  walValve ? () => walValve!.backpressure() : undefined
+                );
+              }
             }
           }
 
@@ -847,7 +893,25 @@ export class CodeGraph {
           try { return this.queries.isNameSegmentVocabEmpty(); } catch { return false; }
         })();
 
-        const result = await this.orchestrator.sync(options.onProgress, options.paths);
+        const semanticInputs = resolveCppSemanticInputs(this.projectRoot);
+        let semanticMembership: ReturnType<QueryBuilder['captureCppSemanticMembership']> | null = null;
+        const result = await this.orchestrator.sync(options.onProgress, options.paths, files => {
+          if (!semanticInputs) return;
+          const cppFiles = files.filter(file => /\.(?:c|cc|cpp|cxx|c\+\+|i|ii|h|hh|hpp|hxx)$/i.test(file));
+          if (cppFiles.length) semanticMembership = this.queries.captureCppSemanticMembership(cppFiles);
+        });
+        // 普通提取会删除再插入文件节点；相同身份的归属不能因随后 clangd 失败而丢失。
+        if (semanticMembership) this.queries.restoreCppSemanticMembership(semanticMembership);
+        const changedCpp = (result.changedFilePaths ?? []).filter(file => /\.(?:c|cc|cpp|cxx|c\+\+|i|ii)$/i.test(file));
+        const changedHeaders = (result.changedFilePaths ?? []).some(file => /\.(?:h|hh|hpp|hxx)$/i.test(file));
+        let previousSemanticState: string | undefined;
+        try {
+          previousSemanticState = JSON.parse(this.queries.getMetadata('semantic_repair_status') ?? '{}').state;
+        } catch { /* 损坏的诊断不能充当成功覆盖证据。 */ }
+        const fullSemanticRepair = !!semanticInputs && !!semanticInputs.fingerprint &&
+          (this.queries.getMetadata('semantic_repair_fingerprint') !== semanticInputs.fingerprint ||
+            changedHeaders || result.filesRemoved > 0 || previousSemanticState !== 'complete');
+        const repairNeeded = !!semanticInputs && (fullSemanticRepair || changedCpp.length > 0 || !!semanticInputs.error);
 
         // Fold the store phase's WAL BEFORE the post-store reads below
         // (resolution reads on the main thread) — same rationale as
@@ -945,7 +1009,7 @@ export class CodeGraph {
                   current: done,
                   total: totalPasses,
                 });
-              }
+              }, undefined, repairNeeded && !!semanticInputs?.fingerprint
             );
           }
         }
@@ -1011,7 +1075,16 @@ export class CodeGraph {
                 current: done,
                 total: totalPasses,
               });
-            }
+            }, undefined, repairNeeded && !!semanticInputs?.fingerprint
+          );
+        }
+
+        if (repairNeeded && semanticInputs) {
+          await this.repairCppSemantics(semanticInputs,
+            fullSemanticRepair ? undefined : changedCpp, options.signal);
+          if (semanticInputs.fingerprint) await this.resolver.synthesizeDynamicEdges(
+            (done, total) => options.onProgress?.({ phase: 'linking', current: done, total }),
+            walValve ? () => walValve!.backpressure() : undefined
           );
         }
 
@@ -1199,6 +1272,33 @@ export class CodeGraph {
     return raw === 'indexing' || raw === 'complete' || raw === 'partial' || raw === 'failed'
       ? raw
       : null;
+  }
+
+  /**
+   * @brief 独立读取 C/C++ 修复诊断，并与当前可信输入指纹比较以判定失效。
+   * @return 未启用时为 null；否则给出修复完成度、统计或输入错误原因
+   */
+  getCppSemanticRepairStatus(): CppSemanticRepairStatus | null {
+    const inputs = resolveCppSemanticInputs(this.projectRoot);
+    if (!inputs) return null;
+    const raw = this.queries.getMetadata('semantic_repair_status');
+    let stored: CppSemanticRepairStatus | null = null;
+    try { stored = raw ? JSON.parse(raw) as CppSemanticRepairStatus : null; }
+    catch { /* 老版本或损坏的诊断只能视为尚未完成。 */ }
+    const current = stored ?? { state: 'stale', clangdVersion: null, viewCount: 0,
+      translationUnits: 0, nodesAdded: 0, callsAdded: 0,
+      callsRepositioned: 0, viewsFailed: 0, durationMs: 0 };
+    if (inputs.error) return { ...current, state: 'failed', reason: inputs.error };
+    if (stored?.state === 'failed') return stored;
+    const attempted = this.queries.getMetadata('semantic_repair_attempt_fingerprint');
+    if (stored?.state === 'partial' && attempted === inputs.fingerprint) return stored;
+    if (!inputs.fingerprint || this.queries.getMetadata('semantic_repair_fingerprint') !== inputs.fingerprint) {
+      return { ...current, state: 'stale', reason: 'semantic repair inputs changed; run codegraph sync' };
+    }
+    if (current.state === 'complete' && this.getIndexState() !== 'complete') {
+      return { ...current, state: 'stale', reason: 'ordinary index is not complete' };
+    }
+    return current;
   }
 
   /**

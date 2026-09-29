@@ -2741,7 +2741,9 @@ export class ExtractionOrchestrator {
      * set is not exactly known (directory removals, event overflow): the full
      * scan-diff remains the ground truth those cases need (#1285).
      */
-    scopedPaths?: string[]
+    scopedPaths?: string[],
+    /** 文件已分类、旧图尚未被删除时，用于保留语义归属的增量提取边界。 */
+    beforeStore?: (filesToIndex: string[]) => void,
   ): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
@@ -2914,6 +2916,7 @@ export class ExtractionOrchestrator {
     // before inserting the new ones, so this is the last point the pre-edit
     // definition set is readable (CG-33).
     if (filesToIndex.length > 0) {
+      beforeStore?.(filesToIndex);
       for (const pair of this.queries.getNodeNamePairsByFiles(filesToIndex)) pairsBefore.add(pair);
     }
 

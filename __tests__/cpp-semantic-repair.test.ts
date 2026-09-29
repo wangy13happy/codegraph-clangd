@@ -661,7 +661,10 @@ describe('C/C++ semantic node reconciliation', () => {
         callee: fact('two', 'variant.c', 'feature', 2, 8), callLine: 21, callColumn: 9 },
     ];
     reconcileCppSemanticNodes(conn.getDb(), queries, input);
-    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 2, removed: 1 });
+    const repositioned: number[] = [];
+    expect(queries.reconcileCppSemanticCalls(input, count => repositioned.push(count)))
+      .toEqual({ added: 2, removed: 1 });
+    expect(repositioned).toEqual([1]);
     expect(conn.getDb().prepare('SELECT id,line,col,provenance FROM edges ORDER BY line').all())
       .toEqual([{ id: original.id, line: 14, col: 4, provenance: 'tree-sitter' },
         { id: expect.any(Number), line: 18, col: 7, provenance: 'clangd' },
@@ -707,7 +710,10 @@ describe('C/C++ semantic node reconciliation', () => {
     input.views[1]!.failedTuCount = 0;
     input.views[1]!.coveredFiles = ['wrong.c'];
     input.views[1]!.analyzedTuCount = 1;
-    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 0, removed: 1 });
+    const repositioned: number[] = [];
+    expect(queries.reconcileCppSemanticCalls(input, count => repositioned.push(count)))
+      .toEqual({ added: 0, removed: 1 });
+    expect(repositioned).toEqual([0]);
     expect(queries.getOutgoingEdges(caller.id, ['calls'])).toMatchObject([
       { target: wrong.id, provenance: 'heuristic' },
       { target: correct.id, provenance: 'clangd' },

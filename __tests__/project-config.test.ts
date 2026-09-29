@@ -40,6 +40,19 @@ describe('C/C++ semantic repair configuration', () => {
     expect(loadCppSemanticRepairConfig(root)?.compileCommands).toBe('build/compile_commands.json');
   });
 
+  it('retains a missing in-project database for failure diagnostics without accepting symlink escape', () => {
+    fs.writeFileSync(path.join(root, 'codegraph.json'), JSON.stringify({ cppSemanticRepair: {
+      enabled: true, compileCommands: 'not-built/yet/compile_commands.json',
+    } }));
+    expect(loadCppSemanticRepairConfig(root)?.compileCommands).toBe('not-built/yet/compile_commands.json');
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-semantic-external-'));
+    try {
+      fs.symlinkSync(outside, path.join(root, 'not-built'));
+      clearProjectConfigCache();
+      expect(loadCppSemanticRepairConfig(root)).toBeNull();
+    } finally { fs.rmSync(outside, { recursive: true, force: true }); }
+  });
+
   it('keeps runtime executable and driver authority on the user side', () => {
     const clangd = path.join(root, 'clangd');
     fs.writeFileSync(clangd, '#!/bin/sh\n');

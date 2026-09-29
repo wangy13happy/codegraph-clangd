@@ -27,7 +27,7 @@ import * as path from 'path';
 import { Language } from './types';
 import { isLanguageSupported } from './extraction/grammars';
 import { logWarn } from './errors';
-import { findCompilationDatabase, isWithinProject } from './semantic/cpp/compile-database';
+import { canonicalizePotentialPath, findCompilationDatabase, isWithinProject } from './semantic/cpp/compile-database';
 
 /** Filename of the project-scoped config, resolved relative to the project root. */
 export const PROJECT_CONFIG_FILENAME = 'codegraph.json';
@@ -224,8 +224,14 @@ function extractCppSemanticRepair(parsed: object, file: string): CppSemanticRepa
   const compileCommands = obj.compileCommands as string | undefined;
   // 仓库选择的 DB 经 realpath 检验必须在真实项目根目录内；用户授权走独立入口。
   if (compileCommands && !findCompilationDatabase(path.dirname(file), compileCommands)) {
-    logWarn('Ignoring cppSemanticRepair: compilation database is missing or outside project root', { file });
-    return null;
+    // 数据库暂缺属于可诊断的 repair failure，不撤销 opt-in；但路径必须仍在真实根目录内。
+    const root = fs.realpathSync(path.dirname(file));
+    const candidate = path.resolve(root, compileCommands);
+    const canonical = canonicalizePotentialPath(candidate);
+    if (!canonical || !isWithinProject(root, canonical) || fs.existsSync(candidate)) {
+      logWarn('Ignoring cppSemanticRepair: compilation database is outside project root or invalid', { file });
+      return null;
+    }
   }
   return { enabled: true, mode: 'union', ...(compileCommands ? { compileCommands } : {}) };
 }

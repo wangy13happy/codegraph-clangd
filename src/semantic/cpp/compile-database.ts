@@ -47,7 +47,7 @@ export function isWithinProject(root: string, candidate: string): boolean {
  * @param[in] candidate 待规范化的绝对路径
  * @return 路径的真实或预期真实位置；无法安全确认时返回 null
  */
-function canonicalizePotentialPath(candidate: string): string | null {
+export function canonicalizePotentialPath(candidate: string): string | null {
   let cursor = candidate;
   while (true) {
     try {

@@ -3,8 +3,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { pathToFileURL } from 'url';
 import { createHash } from 'crypto';
-import { CppSemanticRuntimeOptions } from '../../project-config';
-import { CompilationDatabase } from './compile-database';
+import { execFileSync } from 'child_process';
+import { CppSemanticRuntimeOptions, loadCppSemanticRepairConfig,
+  resolveCppSemanticRuntimeOptions } from '../../project-config';
+import { CompilationDatabase, loadCompilationDatabase } from './compile-database';
 import { ClangdClient } from './clangd-client';
 import { buildCompileViews, CompileView, materializeCompileView } from './compile-views';
 import { documentSymbolFacts, incomingCallFacts, SemanticCallFact, SemanticSymbolFact,
@@ -39,6 +41,52 @@ export interface SemanticFactCollection {
   symbols: SemanticSymbolFact[];
   calls: SemanticCallFact[];
   views: SemanticViewResult[];
+  /** 仅定向同步时提供；不能把未采集视图当作缺失证据。 */
+  scopeFiles?: string[];
+  /** 每个源文件在完整编译数据库中所属的全部视图 ID。 */
+  expectedViewsByFile?: Record<string, string[]>;
+}
+
+export interface CppSemanticInputs {
+  database: CompilationDatabase | null;
+  runtime: CppSemanticRuntimeOptions;
+  clangdVersion: string | null;
+  fingerprint: string | null;
+  error?: string;
+}
+
+const REPAIR_ALGORITHM_VERSION = 1;
+
+/**
+ * @brief 在可信用户侧运行时解析语义输入并散列修复算法、工具、数据库原始字节与配置。
+ * @param[in] projectRoot 项目根目录
+ * @return 当前修复输入及错误原因；工具或数据库不可用时不生成成功指纹
+ */
+export function resolveCppSemanticInputs(projectRoot: string): CppSemanticInputs | null {
+  const config = loadCppSemanticRepairConfig(projectRoot);
+  if (!config) return null;
+  const runtime = resolveCppSemanticRuntimeOptions({}, process.env, projectRoot);
+  const database = loadCompilationDatabase(projectRoot,
+    runtime.compileCommands ?? config.compileCommands, !!runtime.compileCommands);
+  if (!database?.entries.length) return { database, runtime, clangdVersion: null, fingerprint: null,
+    error: 'no compilation database with project C/C++ translation units' };
+  if (!runtime.clangdPath) return { database, runtime, clangdVersion: null, fingerprint: null,
+    error: 'trusted clangd executable unavailable' };
+  try {
+    // 仅调用已验证的用户侧 clangd；绝不执行编译数据库内的 compiler/command。
+    const versionLine = execFileSync(runtime.clangdPath, ['--version'],
+      { encoding: 'utf8', timeout: 3000, maxBuffer: 64 * 1024 }).split(/\r?\n/, 1)[0]!.trim();
+    if (!versionLine) throw new Error('empty clangd version');
+    const clangdVersion = versionLine.match(/\bclangd version\s+(\S+)/i)?.[1] ?? versionLine;
+    const hash = createHash('sha256');
+    hash.update(JSON.stringify([REPAIR_ALGORITHM_VERSION, clangdVersion, config,
+      runtime.clangdPath, runtime.queryDrivers, database.path]));
+    hash.update(fs.readFileSync(database.path));
+    return { database, runtime, clangdVersion, fingerprint: hash.digest('hex') };
+  } catch (error) {
+    return { database, runtime, clangdVersion: null, fingerprint: null,
+      error: `clangd version or compilation database unavailable: ${String(error)}` };
+  }
 }
 
 /**
@@ -154,21 +202,30 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
  * @param[in] projectRoot 项目根目录
  * @param[in] database PR1 共享编译数据库模型
  * @param[in] runtime 已从可信用户输入解析的运行选项，不能来自仓库配置
- * @param[in] options 可选索引取消信号与每请求超时
+ * @param[in] options 可选取消信号、每请求超时和定向同步的实现文件范围
  * @return 每视图覆盖状态和项目内语义事实；失败视图不提供负面证据
  */
 export async function collectCppSemanticFacts(projectRoot: string, database: CompilationDatabase,
-  runtime: CppSemanticRuntimeOptions, options: { signal?: AbortSignal; requestTimeoutMs?: number } = {}):
+  runtime: CppSemanticRuntimeOptions, options: { signal?: AbortSignal; requestTimeoutMs?: number;
+    scopeFiles?: string[] } = {}):
   Promise<SemanticFactCollection> {
   const root = fs.realpathSync(projectRoot);
   const symbols: SemanticSymbolFact[] = [];
   const calls: SemanticCallFact[] = [];
   const views: SemanticViewResult[] = [];
-  for (const view of buildCompileViews(database)) {
+  const compileViews = buildCompileViews(database);
+  const selected = options.scopeFiles && new Set(options.scopeFiles);
+  const expectedViewsByFile: Record<string, string[]> = Object.create(null);
+  for (const view of compileViews) {
+    for (const entry of view.entries) (expectedViewsByFile[entry.file] ??= []).push(view.id);
+  }
+  for (const view of compileViews) {
+    if (selected && !view.entries.some(entry => selected.has(entry.file))) continue;
     const result = await collectView(root, view, runtime, options.signal, options.requestTimeoutMs);
     views.push(result.status);
     symbols.push(...result.symbols);
     calls.push(...result.calls);
   }
-  return { inventory: database.inventory, grouping: database.grouping, symbols, calls, views };
+  return { inventory: database.inventory, grouping: database.grouping, symbols, calls, views,
+    ...(selected ? { scopeFiles: [...selected], expectedViewsByFile } : {}) };
 }

@@ -529,9 +529,11 @@ export class QueryBuilder {
   /**
    * @brief 将 clangd 入向调用及配置归属对账到普通 C/C++ 调用边。
    * @param[in] collection 已完成节点修复的视图事实和运行时覆盖状态
+   * @param[out] onRepositioned 可选统计回调，仅报告由同一调用关系新坐标替代的旧边数
    * @return 新建边和退役旧边数量；事实非法或写入失败时整批回滚
    */
-  reconcileCppSemanticCalls(collection: SemanticFactCollection): { added: number; removed: number } {
+  reconcileCppSemanticCalls(collection: SemanticFactCollection,
+    onRepositioned?: (count: number) => void): { added: number; removed: number } {
     const viewIds = new Set(collection.views.map(view => view.id));
     if (viewIds.size !== collection.views.length) throw new Error('Invalid C/C++ call view inventory');
     /**
@@ -624,7 +626,10 @@ export class QueryBuilder {
      */
     const covered = (file: string): boolean => {
       const relevant = collection.views.filter(view => view.coveredFiles.includes(file) || view.failedFiles.includes(file));
-      return collection.inventory === 'authoritative' && relevant.length > 0 && relevant.every(view =>
+      const expected = collection.expectedViewsByFile?.[file];
+      return collection.inventory === 'authoritative' && relevant.length > 0 &&
+        (!collection.scopeFiles || (!!expected?.length && expected.every(id => relevant.some(view => view.id === id)))) &&
+        relevant.every(view =>
         view.inventory === 'authoritative' && view.success && view.failedFiles.length === 0 &&
         view.failedTuCount === 0 && view.coveredFiles.includes(file) &&
         view.coveredFiles.length === view.analyzedTuCount);
@@ -640,6 +645,8 @@ export class QueryBuilder {
         view.coveredFiles.includes(source.filePath) && view.coveredFiles.includes(target.filePath) &&
         represented.has(`${view.id}\0${source.id}`) && represented.has(`${view.id}\0${target.id}`));
     const result = { added: 0, removed: 0 };
+    let repositioned = 0;
+    const observedRelations = new Set([...observed.values()].map(entry => `${entry.source.id}\0${entry.target.id}`));
     this.db.transaction(() => {
       const select = this.db.prepare('SELECT id,provenance FROM edges WHERE source = ? AND target = ? AND kind = ? AND line = ? AND col = ?');
       const insert = this.db.prepare("INSERT OR IGNORE INTO edges (source,target,kind,line,col,provenance) VALUES (?,?,'calls',?,?,'clangd')");
@@ -684,6 +691,8 @@ export class QueryBuilder {
         const source = this.getNodeById(sourceId);
         if (!source || !covered(source.filePath)) continue;
         for (const edge of stale.all(sourceId) as Array<{ id: number; target: string; line: number | null; col: number | null; name: string }>) {
+          if (collection.scopeFiles && !collection.scopeFiles.includes(source.filePath) &&
+              !collection.scopeFiles.includes(this.getNodeById(edge.target)?.filePath ?? '')) continue;
           // 缺失事实只能否定已纳入语义清单的目标；错误 static 目标需有同名正向证据。
           if (!representedTargets.has(edge.target) && !eligibleNames.get(sourceId)?.has(edge.name)) continue;
           const target = targetNodes.get(edge.target);
@@ -699,11 +708,102 @@ export class QueryBuilder {
               ![...replacements].some(node => fullyObservedRelation(source, node))) continue;
           }
           const key = JSON.stringify([sourceId, edge.target, edge.line, edge.col]);
-          if (!observed.has(key)) result.removed += remove.run(edge.id).changes;
+          if (!observed.has(key)) {
+            const deleted = remove.run(edge.id).changes;
+            result.removed += deleted;
+            if (observedRelations.has(`${sourceId}\0${edge.target}`)) repositioned += deleted;
+          }
         }
       }
     })();
+    onRepositioned?.(repositioned);
     return result;
+  }
+
+  /**
+   * @brief 在增量提取覆盖既有文件前记录将受外键级联影响的语义归属。
+   * @param[in] files 本次确实需要重新提取的 C/C++ 项目相对文件
+   * @return 节点及调用边的已验证配置归属；仅在相同身份重现后可恢复
+   */
+  captureCppSemanticMembership(files: string[]): {
+    semanticNodes: Node[];
+    nodes: Array<{ node_id: string; config_id: string; signature: string | null;
+      definition_line: number | null; definition_col: number | null;
+      file_path: string; kind: string; name: string }>;
+    edges: Array<{ source: string; target: string; kind: string; line: number | null;
+      col: number | null; config_id: string; metadata: string | null; provenance: string | null }>;
+  } {
+    if (!files.length) return { semanticNodes: [], nodes: [], edges: [] };
+    const paths = JSON.stringify(files);
+    const semanticNodes = files.flatMap(file => this.getNodesByFile(file)
+      .filter(node => node.semanticOrigin === 'clangd'));
+    const nodes = this.db.prepare(`
+      SELECT m.node_id,m.config_id,m.signature,m.definition_line,m.definition_col,
+        n.file_path,n.kind,n.name FROM semantic_node_configs m
+      JOIN nodes n ON n.id=m.node_id WHERE n.file_path IN (SELECT value FROM json_each(?))
+    `).all(paths) as ReturnType<QueryBuilder['captureCppSemanticMembership']>['nodes'];
+    const edges = this.db.prepare(`
+      SELECT e.source,e.target,e.kind,e.line,e.col,e.metadata,e.provenance,m.config_id
+      FROM semantic_edge_configs m JOIN edges e ON e.id=m.edge_id
+      JOIN nodes s ON s.id=e.source JOIN nodes t ON t.id=e.target
+      WHERE s.file_path IN (SELECT value FROM json_each(?))
+        OR t.file_path IN (SELECT value FROM json_each(?))
+    `).all(paths, paths) as ReturnType<QueryBuilder['captureCppSemanticMembership']>['edges'];
+    const memberIds = new Set(nodes.map(row => row.node_id));
+    return { semanticNodes: semanticNodes.filter(node => memberIds.has(node.id)), nodes, edges };
+  }
+
+  /**
+   * @brief 恢复增量提取级联清掉、但仍对应同一现存节点或非启发式调用边的语义归属。
+   * @param[in] saved 删除前采集的语义节点和边归属
+   * @return 无；不存在的身份不会因部分语义视图失败而被重新创建
+   */
+  restoreCppSemanticMembership(saved: ReturnType<QueryBuilder['captureCppSemanticMembership']>): void {
+    this.db.transaction(() => {
+      const owners = new Map<string, string>();
+      for (const prior of saved.semanticNodes) {
+        const current = this.getNodeById(prior.id);
+        if (current) {
+          if (current.filePath === prior.filePath && current.kind === prior.kind && current.name === prior.name) {
+            owners.set(prior.id, current.id);
+          }
+          continue;
+        }
+        const baseline = this.getNodesByFile(prior.filePath).find(candidate =>
+          !candidate.semanticOrigin && candidate.kind === prior.kind && candidate.name === prior.name &&
+          semanticRangesOverlap(candidate, prior));
+        if (baseline) owners.set(prior.id, baseline.id);
+        else {
+          // 普通提取未接管此身份；保留旧正向语义证据直到权威完整视图完成刷新。
+          this.insertNode(prior);
+          owners.set(prior.id, prior.id);
+        }
+      }
+      const node = this.db.prepare('SELECT file_path,kind,name FROM nodes WHERE id = ?');
+      const restoreNode = this.db.prepare(`INSERT OR IGNORE INTO semantic_node_configs
+        (node_id,config_id,signature,definition_line,definition_col) VALUES (?,?,?,?,?)`);
+      for (const row of saved.nodes) {
+        const owner = owners.get(row.node_id) ?? row.node_id;
+        const current = node.get(owner) as { file_path: string; kind: string; name: string } | undefined;
+        if (current?.file_path === row.file_path && current.kind === row.kind && current.name === row.name) {
+          restoreNode.run(owner, row.config_id, row.signature, row.definition_line, row.definition_col);
+        }
+      }
+      const edge = this.db.prepare(`SELECT id,provenance FROM edges WHERE source=? AND target=?
+        AND kind=? AND line IS ? AND col IS ?`);
+      const restoreEdge = this.db.prepare('INSERT OR IGNORE INTO semantic_edge_configs (edge_id,config_id) VALUES (?,?)');
+      const insertEdge = this.db.prepare(`INSERT OR IGNORE INTO edges
+        (source,target,kind,line,col,metadata,provenance) VALUES (?,?,?,?,?,?,?)`);
+      for (const row of saved.edges) {
+        const source = owners.get(row.source) ?? row.source;
+        const target = owners.get(row.target) ?? row.target;
+        if (!this.getNodeById(source) || !this.getNodeById(target)) continue;
+        insertEdge.run(source, target, row.kind, row.line, row.col, row.metadata, row.provenance);
+        const current = edge.get(source, target, row.kind, row.line, row.col) as
+          { id: number; provenance: string | null } | undefined;
+        if (current && current.provenance !== 'heuristic') restoreEdge.run(current.id, row.config_id);
+      }
+    })();
   }
 
   /**

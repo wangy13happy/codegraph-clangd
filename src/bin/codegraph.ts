@@ -980,7 +980,11 @@ program
   .command('status [path]')
   .description('Show index status and statistics')
   .option('-j, --json', 'Output as JSON')
-  .action(async (pathArg: string | undefined, options: { json?: boolean }) => {
+  .option('--clangd-path <path>', 'Trusted clangd executable path (or clangd from PATH)')
+  .option('--query-driver <paths>', 'Trusted comma-separated absolute compiler-driver allowlist')
+  .option('--compile-commands <path>', 'Trusted compilation database override (may be outside project)')
+  .action(async (pathArg: string | undefined, options: { json?: boolean; clangdPath?: string;
+    queryDriver?: string; compileCommands?: string }) => {
     const projectPath = resolveProjectPath(pathArg);
     // The directory the user actually ran from, before walking up to the index
     // root. Used to detect when the resolved index lives in a different git
@@ -1007,6 +1011,8 @@ program
         return;
       }
 
+      prepareCppSemanticRuntime(projectPath, options);
+
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
       const stats = cg.getStats();
@@ -1017,6 +1023,7 @@ program
       const buildInfo = cg.getIndexBuildInfo();
       const reindexRecommended = cg.isIndexStale();
       const indexState = cg.getIndexState();
+      const cppSemanticRepair = cg.getCppSemanticRepairStatus();
       // Zero on a healthy index; non-zero at rest means a resolution pass was
       // interrupted, so some files' call edges are missing (#1187).
       const pendingRefs = cg.getPendingReferenceCount();
@@ -1061,6 +1068,7 @@ program
             // sync sweeps them (#1187).
             pendingRefs,
           },
+          cppSemanticRepair,
         }));
         cg.destroy();
         return;
@@ -1082,6 +1090,12 @@ program
       }
       if (pendingRefs > 0) {
         warn(`${formatNumber(pendingRefs)} references from an interrupted run are awaiting resolution — some callers/impact edges are missing. Run "codegraph sync" to resolve them.`);
+      }
+      if (cppSemanticRepair) {
+        console.log(`C/C++ semantic repair: ${cppSemanticRepair.state}`);
+        console.log(`  clangd: ${cppSemanticRepair.clangdVersion ?? 'unavailable'}; views: ${cppSemanticRepair.viewCount}; TUs: ${cppSemanticRepair.translationUnits}; failed views: ${cppSemanticRepair.viewsFailed}`);
+        console.log(`  nodes added: ${cppSemanticRepair.nodesAdded}; calls added: ${cppSemanticRepair.callsAdded}; calls repositioned: ${cppSemanticRepair.callsRepositioned}; duration: ${cppSemanticRepair.durationMs}ms`);
+        if (cppSemanticRepair.reason) warn(`C/C++ semantic repair: ${cppSemanticRepair.reason}`);
       }
       console.log();
 
