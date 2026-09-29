@@ -66,8 +66,11 @@ export function resolveCppSemanticInputs(projectRoot: string): CppSemanticInputs
   const config = loadCppSemanticRepairConfig(projectRoot);
   if (!config) return null;
   const runtime = resolveCppSemanticRuntimeOptions({}, process.env, projectRoot);
+  const databaseStarted = Date.now();
   const database = loadCompilationDatabase(projectRoot,
     runtime.compileCommands ?? config.compileCommands, !!runtime.compileCommands);
+  if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
+    `[semantic-timing] compile-db: ${Date.now() - databaseStarted}ms entries=${database?.entries.length ?? 0}`);
   if (!database?.entries.length) return { database, runtime, clangdVersion: null, fingerprint: null,
     error: 'no compilation database with project C/C++ translation units' };
   if (!runtime.clangdPath) return { database, runtime, clangdVersion: null, fingerprint: null,
@@ -110,13 +113,23 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
   const symbols: SemanticSymbolFact[] = [];
   const calls: SemanticCallFact[] = [];
   const sourceLines: SemanticSourceLines = new Map();
+  let materializeMs = 0;
+  let startupMs = 0;
+  let factsMs = 0;
+  let shutdownMs = 0;
+  let factsStarted: number | undefined;
   let error: string | undefined;
   let client: ClangdClient | undefined;
   try {
     if (signal?.aborted) throw new Error('clangd collection cancelled');
+    const materializeStarted = Date.now();
     const compileDirectory = materializeCompileView(root, view);
+    materializeMs = Date.now() - materializeStarted;
     client = new ClangdClient(root, compileDirectory, runtime, signal, requestTimeoutMs);
-    await client.start();
+    const startupStarted = Date.now();
+    try { await client.start(); }
+    finally { startupMs = Date.now() - startupStarted; }
+    factsStarted = Date.now();
     const open: Array<{ file: string; uri: string }> = [];
     for (const file of files) {
       try {
@@ -198,12 +211,16 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
   } catch (failure) {
     error ??= String(failure);
   } finally {
+    // 将 clangd 关闭耗时单列，避免误记为 LSP 事实采集。
+    if (factsStarted !== undefined) factsMs = Date.now() - factsStarted;
     if (client) {
+      const shutdownStarted = Date.now();
       try { await client.close(); }
       catch (failure) {
         error ??= String(failure);
         covered.length = 0;
       }
+      finally { shutdownMs = Date.now() - shutdownStarted; }
     }
   }
   for (const file of files) if (!covered.includes(file)) failed.add(file);
@@ -212,6 +229,10 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
   const flagsHash = createHash('sha256').update(JSON.stringify(flagSets)).digest('hex');
   const compilers = new Set(view.entries.map(entry => entry.compiler));
   const compiler = compilers.size === 1 ? [...compilers][0] : undefined;
+  if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
+    `[semantic-timing] view=${view.id} materialize=${materializeMs}ms clangd-start=${startupMs}ms ` +
+    `facts=${factsMs}ms shutdown=${shutdownMs}ms total=${Date.now() - started}ms ` +
+    `covered=${covered.length}/${files.length}`);
   return { status: { id: view.id, key: view.key, flagsHash, ...(compiler ? { compiler } : {}),
     inventory: view.inventory, grouping: view.grouping,
     success: failed.size === 0 && !error && !signal?.aborted,
@@ -235,7 +256,10 @@ export async function collectCppSemanticFacts(projectRoot: string, database: Com
   const symbols: SemanticSymbolFact[] = [];
   const calls: SemanticCallFact[] = [];
   const views: SemanticViewResult[] = [];
+  const viewBuildStarted = Date.now();
   const compileViews = buildCompileViews(database);
+  if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
+    `[semantic-timing] build-views: ${Date.now() - viewBuildStarted}ms views=${compileViews.length}`);
   const selected = options.scopeFiles && new Set(options.scopeFiles);
   const expectedViewsByFile: Record<string, string[]> = Object.create(null);
   for (const view of compileViews) {

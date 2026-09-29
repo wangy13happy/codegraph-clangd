@@ -495,21 +495,33 @@ export class CodeGraph {
       callsRepositioned: 0, viewsFailed: 0, durationMs: 0 };
     try {
       if (inputs.error || !inputs.database || !inputs.fingerprint) throw new Error(inputs.error ?? 'semantic inputs unavailable');
+      const collectionStarted = Date.now();
       const facts = await collectCppSemanticFacts(this.projectRoot, inputs.database, inputs.runtime,
         { scopeFiles, signal });
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
+        `[semantic-timing] all-views: ${Date.now() - collectionStarted}ms views=${facts.views.length}`);
       status.viewCount = facts.views.length;
       status.translationUnits = facts.views.reduce((total, view) => total + view.analyzedTuCount, 0);
       status.viewsFailed = facts.views.filter(view => !view.success).length;
       const missingScopedViews = !!scopeFiles && scopeFiles.some(file =>
         (facts.expectedViewsByFile?.[file] ?? []).some(id => !facts.views.some(view =>
           view.id === id && view.success && view.coveredFiles.includes(file))));
+      const nodeTransactionStarted = Date.now();
       const repaired = reconcileCppSemanticNodes(this.db.getDb(), this.queries, facts);
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
+        `[semantic-timing] node-reconciliation: ${Date.now() - nodeTransactionStarted}ms`);
       status.nodesAdded = repaired.nodesAdded;
       this.resolver.clearCaches();
       const retryable = this.queries.getRetryableFailedReferences(repaired.retryNames);
+      const retryStarted = Date.now();
       if (retryable.length) await this.resolver.resolveAndPersistListYielding(retryable);
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
+        `[semantic-timing] retry-references: ${Date.now() - retryStarted}ms count=${retryable.length}`);
+      const callTransactionStarted = Date.now();
       const edges = this.queries.reconcileCppSemanticCalls(facts,
         count => { status.callsRepositioned = count; });
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
+        `[semantic-timing] call-reconciliation: ${Date.now() - callTransactionStarted}ms`);
       status.callsAdded = edges.added;
       status.state = status.viewsFailed || missingScopedViews ? 'partial' : 'complete';
       this.queries.setMetadata('semantic_repair_attempt_fingerprint', inputs.fingerprint);
@@ -685,7 +697,10 @@ export class CodeGraph {
             total: unresolvedCount,
           });
 
+          const semanticInputsStarted = Date.now();
           const semanticInputs = resolveCppSemanticInputs(this.projectRoot);
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS && semanticInputs) console.error(
+            `[semantic-timing] resolve-inputs: ${Date.now() - semanticInputsStarted}ms`);
           const semanticEnabled = !!semanticInputs?.fingerprint;
           const tResolve = Date.now();
           await this.resolveReferencesBatched(
@@ -715,10 +730,13 @@ export class CodeGraph {
                 message: `C/C++ semantic repair ${status.state}: ${status.reason}`, severity: 'warning' });
             } finally {
               if (semanticEnabled) {
+                const dynamicStarted = Date.now();
                 await this.resolver.synthesizeDynamicEdges(
                   (done, total) => options.onProgress?.({ phase: 'linking', current: done, total }),
                   walValve ? () => walValve!.backpressure() : undefined
                 );
+                if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
+                  `[semantic-timing] dynamic-synthesis-after-repair: ${Date.now() - dynamicStarted}ms`);
               }
             }
           }
