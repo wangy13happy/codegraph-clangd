@@ -557,6 +557,7 @@ export class FileWatcher {
     try {
       if (fs.statSync(full).isDirectory()) {
         if (!this.shouldIgnoreDir(full)) this.watchTree(full, /* markExisting */ true);
+        this.advanceCompilationDatabaseWatch(full);
         return;
       }
     } catch {
@@ -653,6 +654,31 @@ export class FileWatcher {
   }
 
   /**
+   * @brief 显式数据库路径的下一层目录出现时推进监听，补回先 mkdir 后写 DB 的事件竞争。
+   * @param[in] dir 刚出现且已确认是目录的绝对路径
+   * @return 无；路径越界或不是候选祖先时不新增监听或同步
+   */
+  private advanceCompilationDatabaseWatch(dir: string): void {
+    const config = loadCppSemanticRepairConfig(this.projectRoot);
+    if (!config?.compileCommands) return;
+    const root = fs.realpathSync(this.projectRoot);
+    const explicit = path.resolve(root, config.compileCommands);
+    const lexicalParent = path.dirname(path.resolve(this.projectRoot, config.compileCommands));
+    const canonical = canonicalizePotentialPath(explicit);
+    if (!canonical || !isWithinProject(root, canonical)) return;
+    const parent = path.dirname(explicit);
+    const actualParent = path.dirname(canonical);
+    if (dir !== parent && !parent.startsWith(`${dir}${path.sep}`) &&
+        dir !== actualParent && !actualParent.startsWith(`${dir}${path.sep}`) &&
+        dir !== lexicalParent && !lexicalParent.startsWith(`${dir}${path.sep}`)) return;
+    this.refreshCompilationDatabaseWatch();
+    // 同一突发可能先创建目录和 DB 再送达目录事件，安装新监听后仍需检查现存文件。
+    if (findCompilationDatabase(root, config.compileCommands)) {
+      this.handleChange(normalizePath(path.relative(root, explicit)));
+    }
+  }
+
+  /**
    * @brief Linux 源码忽略目录内的编译数据库单独建立有界目录监听。
    * @return 无；监听不可用时保留手动 sync 与 status 指纹检查作为后备
    */
@@ -667,11 +693,31 @@ export class FileWatcher {
     const database = findCompilationDatabase(root, config.compileCommands);
     // 显式指定的 DB 尚未创建时，只监听已存在且规范化后仍位于项目内的父目录。
     const candidate = database ?? (explicit && canonicalizePotentialPath(explicit));
-    if (!candidate || !isWithinProject(root, candidate) ||
-        !fs.existsSync(path.dirname(candidate)) || this.dirWatchers.has(path.dirname(candidate))) return;
+    if (!candidate || !isWithinProject(root, candidate)) return;
+    const targetDir = path.dirname(candidate);
+    let watchedDir = targetDir;
+    while (!fs.existsSync(watchedDir)) {
+      const ancestor = path.dirname(watchedDir);
+      if (ancestor === watchedDir) return;
+      watchedDir = ancestor;
+    }
     try {
-      this.compileDatabaseWatcher = watchImpl(path.dirname(candidate), (_event, filename) => {
-        if (this.stopped || filename == null || String(filename) !== path.basename(candidate)) return;
+      if (!fs.statSync(watchedDir).isDirectory()) return;
+    } catch { return; }
+    if (this.dirWatchers.has(watchedDir) ||
+        (watchedDir === root && this.dirWatchers.has(this.projectRoot))) return;
+    const nextDir = path.relative(watchedDir, targetDir).split(path.sep)[0];
+    try {
+      this.compileDatabaseWatcher = watchImpl(watchedDir, (_event, filename) => {
+        if (this.stopped || filename == null) return;
+        if (nextDir && String(filename) === nextDir) {
+          const appeared = path.join(watchedDir, nextDir);
+          try {
+            if (fs.statSync(appeared).isDirectory()) this.advanceCompilationDatabaseWatch(appeared);
+          } catch { /* 删除或无权限时不把非目录当成新监听目标。 */ }
+          return;
+        }
+        if (nextDir || String(filename) !== path.basename(candidate)) return;
         const selected = findCompilationDatabase(root, config.compileCommands);
         const current = selected ?? (explicit && canonicalizePotentialPath(explicit));
         if (!current || !isWithinProject(root, current)) return;

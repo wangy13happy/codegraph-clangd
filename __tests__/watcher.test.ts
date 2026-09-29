@@ -746,6 +746,122 @@ describe('FileWatcher', () => {
       } finally { watcher.stop(); }
     });
 
+    it.skipIf(process.platform !== 'linux')('follows missing ignored build ancestors until the database is created', async () => {
+      const build = path.join(testDir, 'build');
+      const generated = path.join(build, 'generated');
+      fs.writeFileSync(path.join(testDir, '.gitignore'), 'build/\n');
+      fs.writeFileSync(path.join(testDir, 'codegraph.json'), JSON.stringify({
+        cppSemanticRepair: { enabled: true, compileCommands: 'build/generated/compile_commands.json' },
+      }));
+      const listeners = new Map<string, (...args: string[]) => void>();
+      const active = new Set<string>();
+      __setFsWatchForTests(((dir: string, options: unknown, callback?: unknown) => {
+        listeners.set(dir, (typeof options === 'function' ? options : callback) as (...args: string[]) => void);
+        active.add(dir);
+        return { close: () => { active.delete(dir); }, on: () => {} } as unknown as fs.FSWatcher;
+      }) as unknown as typeof fs.watch);
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 50 });
+      try {
+        expect(watcher.start()).toBe(true);
+        expect(active.has(testDir)).toBe(true);
+        fs.mkdirSync(build);
+        listeners.get(testDir)!('rename', 'build');
+        expect(active.has(build)).toBe(true);
+        expect([...active].filter(dir => dir === build || dir === generated)).toHaveLength(1);
+        fs.mkdirSync(generated);
+        listeners.get(build)!('rename', 'generated');
+        expect(active.has(build)).toBe(false);
+        expect(active.has(generated)).toBe(true);
+        fs.writeFileSync(path.join(generated, 'compile_commands.json'), '[]');
+        listeners.get(generated)!('rename', 'compile_commands.json');
+        await waitFor(() => syncFn.mock.calls.length > 0);
+        expect(syncFn.mock.calls[0]![0]).toBeUndefined();
+      } finally { watcher.stop(); }
+    });
+
+    it.skipIf(process.platform !== 'linux')('detects a database written before the ignored directory event is delivered', async () => {
+      const build = path.join(testDir, 'build');
+      fs.writeFileSync(path.join(testDir, '.gitignore'), 'build/\n');
+      fs.writeFileSync(path.join(testDir, 'codegraph.json'), JSON.stringify({
+        cppSemanticRepair: { enabled: true, compileCommands: 'build/generated/compile_commands.json' },
+      }));
+      const listeners = new Map<string, (...args: string[]) => void>();
+      __setFsWatchForTests(((dir: string, options: unknown, callback?: unknown) => {
+        listeners.set(dir, (typeof options === 'function' ? options : callback) as (...args: string[]) => void);
+        return { close: () => {}, on: () => {} } as unknown as fs.FSWatcher;
+      }) as unknown as typeof fs.watch);
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 50 });
+      try {
+        expect(watcher.start()).toBe(true);
+        fs.mkdirSync(path.join(build, 'generated'), { recursive: true });
+        fs.writeFileSync(path.join(build, 'generated', 'compile_commands.json'), '[]');
+        listeners.get(testDir)!('rename', 'build');
+        expect(listeners.has(path.join(build, 'generated'))).toBe(true);
+        await waitFor(() => syncFn.mock.calls.length > 0);
+        expect(syncFn.mock.calls[0]![0]).toBeUndefined();
+      } finally { watcher.stop(); }
+    });
+
+    it.skipIf(process.platform !== 'linux')('does not follow an ignored build symlink outside the project', async () => {
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-watcher-outside-'));
+      fs.writeFileSync(path.join(testDir, '.gitignore'), 'build/\n');
+      fs.writeFileSync(path.join(testDir, 'codegraph.json'), JSON.stringify({
+        cppSemanticRepair: { enabled: true, compileCommands: 'build/compile_commands.json' },
+      }));
+      const listeners = new Map<string, (...args: string[]) => void>();
+      __setFsWatchForTests(((dir: string, options: unknown, callback?: unknown) => {
+        listeners.set(dir, (typeof options === 'function' ? options : callback) as (...args: string[]) => void);
+        return { close: () => {}, on: () => {} } as unknown as fs.FSWatcher;
+      }) as unknown as typeof fs.watch);
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 50 });
+      try {
+        expect(watcher.start()).toBe(true);
+        fs.writeFileSync(path.join(outside, 'compile_commands.json'), '[]');
+        fs.symlinkSync(outside, path.join(testDir, 'build'), 'dir');
+        listeners.get(testDir)!('rename', 'build');
+        expect(listeners.has(outside)).toBe(false);
+        await new Promise(resolve => setTimeout(resolve, 150));
+        expect(syncFn).not.toHaveBeenCalled();
+      } finally {
+        watcher.stop();
+        fs.rmSync(outside, { recursive: true, force: true });
+      }
+    });
+
+    it.skipIf(process.platform !== 'linux')('follows missing build under a symlinked project root', async () => {
+      const aliasDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-watcher-root-alias-'));
+      const alias = path.join(aliasDir, 'project');
+      fs.symlinkSync(testDir, alias, 'dir');
+      fs.writeFileSync(path.join(testDir, '.gitignore'), 'build/\n');
+      fs.writeFileSync(path.join(testDir, 'codegraph.json'), JSON.stringify({
+        cppSemanticRepair: { enabled: true, compileCommands: 'build/compile_commands.json' },
+      }));
+      const listeners = new Map<string, (...args: string[]) => void>();
+      __setFsWatchForTests(((dir: string, options: unknown, callback?: unknown) => {
+        listeners.set(dir, (typeof options === 'function' ? options : callback) as (...args: string[]) => void);
+        return { close: () => {}, on: () => {} } as unknown as fs.FSWatcher;
+      }) as unknown as typeof fs.watch);
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = new FileWatcher(alias, syncFn, { debounceMs: 50 });
+      try {
+        expect(watcher.start()).toBe(true);
+        const build = path.join(testDir, 'build');
+        fs.mkdirSync(build);
+        listeners.get(alias)!('rename', 'build');
+        expect(listeners.has(build)).toBe(true);
+        fs.writeFileSync(path.join(build, 'compile_commands.json'), '[]');
+        listeners.get(build)!('rename', 'compile_commands.json');
+        await waitFor(() => syncFn.mock.calls.length > 0);
+        expect(syncFn.mock.calls[0]![0]).toBeUndefined();
+      } finally {
+        watcher.stop();
+        fs.rmSync(aliasDir, { recursive: true, force: true });
+      }
+    });
+
     it('should expose edited paths via getPendingFiles before sync fires', async () => {
       // Slow debounce — pending entries are visible until the debounce fires.
       // The synthetic event is synchronous, so we can assert immediately.
