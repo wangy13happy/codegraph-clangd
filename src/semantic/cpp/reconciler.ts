@@ -111,6 +111,14 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
         .filter(node => node.kind === fact.kind && node.name === fact.name &&
           semanticRangesOverlap(node, fact))
         .sort((a, b) => compareCandidate(a, b, fact));
+      // 分别与当前事实重叠不具有传递性；候选旧身份必须彼此也能安全归并。
+      for (let i = 0; i < candidates.length; i++) {
+        for (let j = i + 1; j < candidates.length; j++) {
+          if (!semanticRangesOverlap(candidates[i]!, candidates[j]!)) {
+            throw new Error('Cannot merge unverified semantic identity');
+          }
+        }
+      }
       let winner = candidates[0];
       if (!winner) {
         winner = { id: generateNodeId(fact.filePath, fact.kind, fact.name, fact.startLine),

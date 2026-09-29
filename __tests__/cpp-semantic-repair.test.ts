@@ -220,7 +220,7 @@ describe('C/C++ semantic node reconciliation', () => {
       .toEqual([{ node_id: recovered.id }]);
   });
 
-  it('uses the same verified reference transfer when overlapping semantic identities merge', () => {
+  it('rejects a bridging fact rather than rebinding references between disjoint definitions', () => {
     reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [
       fact('one', 'variant.c', 'feature', 2, 6),
       fact('one', 'variant.c', 'feature', 7, 11),
@@ -230,15 +230,58 @@ describe('C/C++ semantic node reconciliation', () => {
     queries.insertNode(caller);
     queries.insertEdge({ source: caller.id, target: second!.id, kind: 'references',
       line: 35, column: 8, metadata: { refName: 'feature', refKind: 'function_ref' } });
-    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [
+    expect(() => reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [
       fact('one', 'variant.c', 'feature', 4, 9),
-    ]));
-    expect(queries.getNodesByFile('variant.c').map(node => node.id)).toEqual([first!.id]);
+    ]))).toThrow(/semantic identity/);
+    expect(queries.getNodesByFile('variant.c').map(node => node.id)).toEqual([first!.id, second!.id]);
     expect(conn.getDb().prepare('SELECT source,target,line,col FROM edges').all()).toEqual([
-      { source: caller.id, target: first!.id, line: 35, col: 8 },
+      { source: caller.id, target: second!.id, line: 35, col: 8 },
+    ]);
+    expect(conn.getDb().prepare('SELECT node_id FROM semantic_node_configs ORDER BY node_id').all())
+      .toEqual([first!.id, second!.id].sort().map(node_id => ({ node_id })));
+  });
+
+  it('retains a verified reference when two existing semantic identities directly overlap', () => {
+    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [
+      fact('one', 'variant.c', 'feature', 2, 12),
+    ]));
+    const original = queries.getNodesByFile('variant.c')[0]!;
+    const duplicate = { ...original, id: generateNodeId('variant.c', 'function', 'feature', 5),
+      startLine: 5 };
+    queries.insertNode(duplicate);
+    const caller = baseline('caller.c', 'caller', 30, 40);
+    queries.insertNode(caller);
+    queries.insertEdge({ source: caller.id, target: duplicate.id, kind: 'references',
+      line: 35, column: 8, metadata: { refName: 'feature', refKind: 'function_ref' } });
+    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [
+      fact('one', 'variant.c', 'feature', 2, 12),
+    ]));
+    expect(queries.getNodesByFile('variant.c').map(node => node.id)).toEqual([original.id]);
+    expect(conn.getDb().prepare('SELECT source,target,line,col FROM edges').all()).toEqual([
+      { source: caller.id, target: original.id, line: 35, col: 8 },
     ]);
     expect(conn.getDb().prepare('SELECT node_id FROM semantic_node_configs').all())
-      .toEqual([{ node_id: first!.id }]);
+      .toEqual([{ node_id: original.id }]);
+  });
+
+  it('rejects a baseline spanning two disjoint semantic definitions without merging either', () => {
+    reconcileCppSemanticNodes(conn.getDb(), queries, collection(['one'], [
+      fact('one', 'variant.c', 'feature', 2, 6),
+      fact('one', 'variant.c', 'feature', 7, 11),
+    ]));
+    const [first, second] = queries.getNodesByFile('variant.c');
+    const caller = baseline('caller.c', 'caller', 30, 40);
+    queries.insertNode(caller);
+    queries.insertEdge({ source: caller.id, target: second!.id, kind: 'references',
+      line: 35, column: 8, metadata: { refName: 'feature', refKind: 'function_ref' } });
+    const bridge = baseline('variant.c', 'feature', 4, 9);
+    expect(() => queries.insertNodes([bridge])).toThrow(/semantic identity/);
+    expect(queries.getNodeById(bridge.id)).toBeNull();
+    expect(queries.getNodesByFile('variant.c').map(node => node.id)).toEqual([first!.id, second!.id]);
+    expect(conn.getDb().prepare('SELECT source,target FROM edges').all())
+      .toEqual([{ source: caller.id, target: second!.id }]);
+    expect(conn.getDb().prepare('SELECT node_id FROM semantic_node_configs ORDER BY node_id').all())
+      .toEqual([first!.id, second!.id].sort().map(node_id => ({ node_id })));
   });
 
   it('transfers ownership in the bulk ordinary extraction path as well', () => {

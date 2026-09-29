@@ -394,13 +394,18 @@ export class QueryBuilder {
    * @brief 事务内将旧语义身份的配置归属和可验证普通引用迁至获胜节点，再删除旧节点。
    * @param[in] winner 保留的节点 ID，调用前必须已写入数据库
    * @param[in] loser 待删除的 clangd 独占节点 ID
-   * @return 无；调用方负责包裹事务，未知来源的边仍随旧节点删除
+   * @return 无；身份不一致时抛错，由调用方事务回滚全部写入
    */
   mergeSemanticNode(winner: string, loser: string): void {
     if (winner === loser) return;
-    const old = this.db.prepare('SELECT name FROM nodes WHERE id = ? AND semantic_origin = ?')
-      .get(loser, 'clangd') as { name: string } | undefined;
-    if (!old) throw new Error('Missing semantic node for identity merge');
+    const identity = this.db.prepare('SELECT * FROM nodes WHERE id = ?');
+    const old = identity.get(loser) as NodeRow | undefined;
+    const retained = identity.get(winner) as NodeRow | undefined;
+    if (!old || old.semantic_origin !== 'clangd' || !retained ||
+        old.file_path !== retained.file_path || old.kind !== retained.kind ||
+        old.name !== retained.name || !semanticRangesOverlap(rowToNode(old), rowToNode(retained))) {
+      throw new Error('Cannot merge unverified semantic identity');
+    }
     this.db.prepare(`
       INSERT INTO semantic_node_configs (node_id, config_id, signature, definition_line, definition_col)
       SELECT ?, config_id, signature, definition_line, definition_col
@@ -433,18 +438,21 @@ export class QueryBuilder {
   private takeOverSemanticNodes(node: Node): void {
     if (node.semanticOrigin || (node.language !== 'c' && node.language !== 'cpp') ||
         (node.kind !== 'function' && node.kind !== 'method')) return;
-    const candidates = this.db.prepare(`
+    const candidates = (this.db.prepare(`
       SELECT * FROM nodes WHERE file_path = ? AND kind = ? AND name = ?
         AND semantic_origin = 'clangd' AND start_line <= ? AND end_line >= ?
       ORDER BY start_line, id
-    `).all(node.filePath, node.kind, node.name, node.endLine, node.startLine) as NodeRow[];
-    for (const row of candidates) {
-      if (row.id === node.id || !semanticRangesOverlap(node, {
-        startLine: row.start_line, startColumn: row.start_column,
-        endLine: row.end_line, endColumn: row.end_column,
-      })) continue;
-      this.mergeSemanticNode(node.id, row.id);
+    `).all(node.filePath, node.kind, node.name, node.endLine, node.startLine) as NodeRow[])
+      .map(rowToNode).filter(old => old.id !== node.id && semanticRangesOverlap(node, old));
+    // 新 baseline 分别重叠两个旧定义，不表示那两个旧定义可以互相归并。
+    for (let i = 0; i < candidates.length; i++) {
+      for (let j = i + 1; j < candidates.length; j++) {
+        if (!semanticRangesOverlap(candidates[i]!, candidates[j]!)) {
+          throw new Error('Cannot merge unverified semantic identity');
+        }
+      }
     }
+    for (const old of candidates) this.mergeSemanticNode(node.id, old.id);
   }
 
   /**
