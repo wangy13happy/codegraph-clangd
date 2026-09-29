@@ -22,7 +22,7 @@ import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-u
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
-import { semanticRangesOverlap } from '../semantic/cpp/facts';
+import { semanticRangesOverlap, assertPairwiseSemanticOverlap } from '../semantic/cpp/facts';
 
 /**
  * Files that should not be candidates for "dominant file" detection: test/spec
@@ -444,14 +444,7 @@ export class QueryBuilder {
       ORDER BY start_line, id
     `).all(node.filePath, node.kind, node.name, node.endLine, node.startLine) as NodeRow[])
       .map(rowToNode).filter(old => old.id !== node.id && semanticRangesOverlap(node, old));
-    // 新 baseline 分别重叠两个旧定义，不表示那两个旧定义可以互相归并。
-    for (let i = 0; i < candidates.length; i++) {
-      for (let j = i + 1; j < candidates.length; j++) {
-        if (!semanticRangesOverlap(candidates[i]!, candidates[j]!)) {
-          throw new Error('Cannot merge unverified semantic identity');
-        }
-      }
-    }
+    assertPairwiseSemanticOverlap(candidates);
     for (const old of candidates) this.mergeSemanticNode(node.id, old.id);
   }
 

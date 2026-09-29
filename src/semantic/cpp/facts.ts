@@ -40,6 +40,23 @@ export function semanticRangesOverlap(left: Pick<SemanticSymbolIdentity, 'startL
   return left.endLine === right.endLine || sharedLines * 2 >= shorter;
 }
 
+/**
+ * @brief 确认已筛选的旧候选彼此也有直接的源码身份重叠。
+ * @param[in] candidates 同文件、类型、名称且各自匹配当前事实或基线节点的旧候选
+ * @return 无；存在不能直接归并的旧候选时抛错，由调用方事务回滚
+ */
+export function assertPairwiseSemanticOverlap(candidates: ReadonlyArray<Pick<SemanticSymbolIdentity,
+  'startLine' | 'endLine' | 'startColumn' | 'endColumn'>>): void {
+  // 分别与新事实重叠不具有传递性，不能据此归并原本分离的旧定义。
+  for (let i = 0; i < candidates.length; i++) {
+    for (let j = i + 1; j < candidates.length; j++) {
+      if (!semanticRangesOverlap(candidates[i]!, candidates[j]!)) {
+        throw new Error('Cannot merge unverified semantic identity');
+      }
+    }
+  }
+}
+
 export interface SemanticCallFact {
   configId: string;
   caller: SemanticSymbolIdentity;
