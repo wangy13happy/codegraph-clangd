@@ -6,7 +6,7 @@ import { createHash } from 'crypto';
 import { loadCompilationDatabase } from '../src/semantic/cpp/compile-database';
 import { ClangdClient } from '../src/semantic/cpp/clangd-client';
 import { buildCompileViews, collectCppSemanticFacts, materializeCompileView, projectFileFromUri } from '../src/semantic/cpp';
-import { normalizeLspPosition } from '../src/semantic/cpp/facts';
+import { incomingCallFacts, normalizeLspPosition } from '../src/semantic/cpp/facts';
 import { pathToFileURL } from 'url';
 
 const fixture = path.join(__dirname, 'fixtures', 'cpp-semantic-repair');
@@ -121,6 +121,48 @@ describe('C/C++ semantic fact collector', () => {
     expect(views.every(v => v.inventory === 'advisory')).toBe(true);
     expect(views.filter(v => v.key.startsWith('cmake:same:'))).toHaveLength(2);
     expect(views.find(v => v.key.startsWith('flags:'))?.grouping).toBe('semantic-flags');
+  });
+
+  /**
+   * @brief clangd 调用层级只给签名范围时，按调用点在同文件同名定义体中唯一消歧。
+   * @return 无；断言同行两个同名定义的完整身份和真实调用列号
+   */
+  it('binds signature-only incoming callers to the unique full same-line definition', () => {
+    const source='int twin(){ target(); } int twin(){ target(); }\n';
+    fs.writeFileSync(path.join(root, 'twins.c'), source);
+    const uri=pathToFileURL(path.join(root, 'twins.c')).href;
+    const targetUri=pathToFileURL(path.join(root, 'callee.c')).href;
+    const second=source.indexOf('int twin', 1);
+    const firstCall=source.indexOf('target(');
+    const secondCall=source.lastIndexOf('target(');
+    const definitions=new Map([['twins.c\0function\0twin', [
+      { filePath: 'twins.c', kind: 'function' as const, name: 'twin', startLine: 1,
+        startColumn: 0, endLine: 1, endColumn: second },
+      { filePath: 'twins.c', kind: 'function' as const, name: 'twin', startLine: 1,
+        startColumn: second, endLine: 1, endColumn: source.trimEnd().length },
+    ]]]);
+    /**
+     * @brief 构造同行内的零起始 LSP 源码范围。
+     * @param[in] start 范围起始列
+     * @param[in] end 范围结束列
+     * @return 指定列号的 LSP 范围
+     */
+    const range=(start: number, end: number)=>({ start: { line: 0, character: start },
+      end: { line: 0, character: end } });
+    const callee={ name: 'target', kind: 12, uri: targetUri,
+      range:range(0,6), selectionRange:range(0,6) };
+    const from={ name: 'twin', kind: 12, uri, range:range(second+4,second+8),
+      selectionRange:range(second+4,second+8) };
+    const facts=incomingCallFacts(root,'one',callee,[
+      { from, fromRanges:[range(firstCall,firstCall+6)] },
+      { from, fromRanges:[range(secondCall,secondCall+6)] },
+      { from:{...from,name:'callbackTable',kind:13},
+        fromRanges:[range(firstCall,firstCall+6)] },
+    ],new Map(),definitions,()=>{ throw Error('完整定义无法消歧'); });
+    expect(facts.map(fact=>[fact.caller.startColumn,fact.callLine,fact.callColumn]))
+      .toEqual([[0,1,firstCall],[second,1,secondCall]]);
+    expect(facts.every(fact=>fact.callLine>=fact.caller.startLine&&
+      fact.callLine<=fact.caller.endLine)).toBe(true);
   });
 
   it.skipIf(!realClangd)('keeps conditional same-file static identities at distinct source ranges', async () => {

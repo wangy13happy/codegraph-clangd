@@ -137,13 +137,33 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
       await client.waitForIndex();
       indexReady = true;
     } catch (failure) { error ??= `clangd index readiness unavailable: ${String(failure)}`; }
+    const discoveredByFile = new Map<string, ReturnType<typeof documentSymbolFacts>>();
     for (const { file, uri } of open) {
       if (signal?.aborted) throw new Error('clangd collection cancelled');
       try {
         const discovered = documentSymbolFacts(root, uri, view.id, await client.documentSymbols(uri), sourceLines);
+        discoveredByFile.set(file, discovered);
+        symbols.push(...discovered.map(item => item.fact));
+      } catch (failure) {
+        failed.add(file);
+        error ??= String(failure);
+      }
+    }
+    // 跨 TU 的 incoming 调用可先于 caller 文件遍历到达；所有定义须先完成采集。
+    const definitions = new Map<string, SemanticSymbolFact[]>();
+    for (const fact of symbols) {
+      const key = `${fact.filePath}\0${fact.kind}\0${fact.name}`;
+      const existing = definitions.get(key) ?? [];
+      existing.push(fact);
+      definitions.set(key, existing);
+    }
+    for (const { file, uri } of open) {
+      if (signal?.aborted) throw new Error('clangd collection cancelled');
+      const discovered = discoveredByFile.get(file);
+      if (!discovered) continue;
+      try {
         let complete = indexReady;
         for (const { fact, position } of discovered) {
-          symbols.push(fact);
           try {
             const items = await client.prepareCallHierarchy(uri, position);
             // 无 call-hierarchy 身份不能证明该函数没有 incoming 调用。
@@ -156,7 +176,8 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
                 complete = false;
                 continue;
               }
-              calls.push(...incomingCallFacts(root, view.id, item, await client.incomingCalls(item), sourceLines));
+              calls.push(...incomingCallFacts(root, view.id, item, await client.incomingCalls(item),
+                sourceLines, definitions, () => { complete = false; }));
             }
           } catch (failure) {
             complete = false;

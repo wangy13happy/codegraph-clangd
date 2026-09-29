@@ -133,6 +133,8 @@ export interface IndexOptions {
   verbose?: boolean;
   /** Watcher fast path: reconcile ONLY these project-relative paths (see ExtractionOrchestrator.sync). */
   paths?: string[];
+  /** MCP 打开项目时不因未变化的 partial 视图反复阻塞首个热查询；显式 sync 仍重试。 */
+  skipPartialSemanticRetry?: boolean;
 }
 
 export interface CppSemanticRepairStatus {
@@ -908,9 +910,13 @@ export class CodeGraph {
         try {
           previousSemanticState = JSON.parse(this.queries.getMetadata('semantic_repair_status') ?? '{}').state;
         } catch { /* 损坏的诊断不能充当成功覆盖证据。 */ }
+        const unchangedPartial = !!options.skipPartialSemanticRetry && previousSemanticState === 'partial' &&
+          result.filesAdded === 0 && result.filesModified === 0 && result.filesRemoved === 0 &&
+          this.queries.getMetadata('semantic_repair_attempt_fingerprint') === semanticInputs?.fingerprint;
         const fullSemanticRepair = !!semanticInputs && !!semanticInputs.fingerprint &&
-          (this.queries.getMetadata('semantic_repair_fingerprint') !== semanticInputs.fingerprint ||
-            changedHeaders || result.filesRemoved > 0 || previousSemanticState !== 'complete');
+          ((this.queries.getMetadata('semantic_repair_fingerprint') !== semanticInputs.fingerprint && !unchangedPartial) ||
+            changedHeaders || result.filesRemoved > 0 ||
+            previousSemanticState !== 'complete' && !unchangedPartial);
         const repairNeeded = !!semanticInputs && (fullSemanticRepair || changedCpp.length > 0 || !!semanticInputs.error);
 
         // Fold the store phase's WAL BEFORE the post-store reads below

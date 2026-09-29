@@ -42,6 +42,7 @@ import * as os from 'os';
 import CodeGraph from '../src/index';
 import { createDatabase } from '../src/db/sqlite-adapter';
 import { collectCppSemanticFacts, type SemanticFactCollection } from '../src/semantic/cpp';
+import { ToolHandler } from '../src/mcp/tools';
 
 vi.mock('../src/semantic/cpp', async importOriginal => ({
   ...await importOriginal<typeof import('../src/semantic/cpp')>(),
@@ -544,6 +545,37 @@ describe('C/C++ semantic sync convergence', () => {
     expect(graph.getCppSemanticRepairStatus()).toMatchObject({ state: 'partial', viewsFailed: 1 });
     vi.mocked(collectCppSemanticFacts).mockResolvedValue(semanticFacts(1));
     await graph.sync();
+    expect(graph.getCppSemanticRepairStatus()?.state).toBe('complete');
+  });
+
+  /**
+   * @brief 启动时无变更的 catch-up 不重试未覆盖视图，显式同步及头文件变更仍重试。
+   * @return 无；断言热查询门控不触发语义采集但修复入口保持可用
+   */
+  it('avoids repeating an unchanged partial repair during MCP catch-up', async () => {
+    const partial = semanticFacts(1);
+    partial.views[0]!.success = false;
+    partial.views[0]!.failedFiles = ['a.c'];
+    partial.views[0]!.coveredFiles = ['b.c'];
+    partial.views[0]!.failedTuCount = 1;
+    vi.mocked(collectCppSemanticFacts).mockResolvedValue(partial);
+    graph = CodeGraph.initSync(root);
+    await graph.indexAll();
+    expect(graph.getCppSemanticRepairStatus()?.state).toBe('partial');
+    vi.mocked(collectCppSemanticFacts).mockClear();
+    await graph.sync({ skipPartialSemanticRetry: true });
+    expect(vi.mocked(collectCppSemanticFacts)).not.toHaveBeenCalled();
+    expect(graph.getCppSemanticRepairStatus()?.state).toBe('partial');
+    const handler = new ToolHandler(graph);
+    handler.setCatchUpGate(graph.sync({ skipPartialSemanticRetry: true }).then(() => undefined));
+    const query = await handler.execute('codegraph_search', { query: 'caller' });
+    expect(query.isError).toBeFalsy();
+    expect(query.content[0]?.text).toContain('caller');
+    expect(vi.mocked(collectCppSemanticFacts)).not.toHaveBeenCalled();
+    vi.mocked(collectCppSemanticFacts).mockResolvedValue(semanticFacts(1));
+    fs.writeFileSync(path.join(root, 'config.h'), '#define ENABLED 1\n');
+    await graph.sync({ skipPartialSemanticRetry: true });
+    expect(vi.mocked(collectCppSemanticFacts)).toHaveBeenCalledOnce();
     expect(graph.getCppSemanticRepairStatus()?.state).toBe('complete');
   });
 

@@ -344,7 +344,7 @@ export class MCPEngine {
     const cg = this.cg;
     if (!cg) return;
     const p = cg
-      .sync()
+      .sync({ skipPartialSemanticRetry: true })
       .then((result) => {
         const changed = result.filesAdded + result.filesModified + result.filesRemoved;
         if (changed > 0) {

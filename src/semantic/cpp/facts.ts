@@ -215,19 +215,33 @@ export function documentSymbolFacts(root: string, uri: string, configId: string,
  * @param[in] callee 已通过层级查询定位的被调函数
  * @param[in] incoming clangd 返回的 caller 及调用范围
  * @param[in,out] sourceLines 当前视图的源码行缓存
+ * @param[in] definitions 同一视图已核实的完整函数定义，按文件、类型和名称分组
+ * @param[in] onUnresolved 无法唯一定位调用者时将视图标为非完整覆盖
  * @return 所有可验证的项目内调用事实
  */
 export function incomingCallFacts(root: string, configId: string, callee: LspCallHierarchyItem,
-  incoming: LspIncomingCall[], sourceLines: SemanticSourceLines): SemanticCallFact[] {
+  incoming: LspIncomingCall[], sourceLines: SemanticSourceLines,
+  definitions: ReadonlyMap<string, ReadonlyArray<SemanticSymbolIdentity>>,
+  onUnresolved: () => void): SemanticCallFact[] {
   const target = symbolIdentity(root, callee.uri, callee.kind, callee.name, callee.range, sourceLines);
   if (!target) return [];
   const facts: SemanticCallFact[] = [];
   for (const call of incoming) {
-    const caller = symbolIdentity(root, call.from.uri, call.from.kind, call.from.name, call.from.range, sourceLines);
-    if (!caller) continue;
+    // clangd 会把函数指针注册表等变量引用也放入 incoming；它们不是可删除的直接调用边。
+    if (call.from.kind !== 12 && call.from.kind !== 6) continue;
+    const signature = symbolIdentity(root, call.from.uri, call.from.kind, call.from.name, call.from.range, sourceLines);
+    if (!signature) { onUnresolved(); continue; }
     for (const range of call.fromRanges) {
-      const position = sourcePosition(root, caller.filePath, range.start, sourceLines);
-      if (position) facts.push({ configId, caller, callee: target,
+      const position = sourcePosition(root, signature.filePath, range.start, sourceLines);
+      if (!position) { onUnresolved(); continue; }
+      // clangd incoming.from.range 可只覆盖签名；真实归属由完整定义范围和调用点共同决定。
+      const candidates = (definitions.get(`${signature.filePath}\0${signature.kind}\0${signature.name}`) ?? [])
+        .filter(definition => (position.line > definition.startLine ||
+          position.line === definition.startLine && position.column >= definition.startColumn) &&
+          (position.line < definition.endLine ||
+          position.line === definition.endLine && position.column < definition.endColumn));
+      if (candidates.length !== 1) { onUnresolved(); continue; }
+      facts.push({ configId, caller: candidates[0]!, callee: target,
         callLine: position.line, callColumn: position.column });
     }
   }
