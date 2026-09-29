@@ -77,11 +77,17 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
         error ??= String(failure);
       }
     }
+    let indexReady = false;
+    try {
+      // clangd 的 sync 扩展等待已打开 TU、CDB 与后台索引空闲；普通请求的空结果不提供该证据。
+      await client.waitForIndex();
+      indexReady = true;
+    } catch (failure) { error ??= `clangd index readiness unavailable: ${String(failure)}`; }
     for (const { file, uri } of open) {
       if (signal?.aborted) throw new Error('clangd collection cancelled');
       try {
         const discovered = documentSymbolFacts(root, uri, view.id, await client.documentSymbols(uri), sourceLines);
-        let complete = true;
+        let complete = indexReady;
         for (const { fact, position } of discovered) {
           symbols.push(fact);
           try {
@@ -102,6 +108,10 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
             complete = false;
             error ??= String(failure);
           }
+        }
+        if (!client.hasCleanDiagnostics(uri)) {
+          complete = false;
+          error ??= `clangd diagnostics missing or erroneous: ${file}`;
         }
         if (complete) covered.push(file);
         else failed.add(file);

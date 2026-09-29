@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { loadCompilationDatabase } from '../src/semantic/cpp/compile-database';
+import { ClangdClient } from '../src/semantic/cpp/clangd-client';
 import { buildCompileViews, collectCppSemanticFacts, materializeCompileView, projectFileFromUri } from '../src/semantic/cpp';
 import { normalizeLspPosition } from '../src/semantic/cpp/facts';
 import { pathToFileURL } from 'url';
@@ -116,6 +117,71 @@ describe('C/C++ semantic fact collector', () => {
     expect(result.calls.filter(c => c.callee.name === 'external_target'))
       .toMatchObject([{ caller: { filePath: 'caller.c', name: 'from_other' }, callLine: 2, callColumn: 30 }]);
   }, 30_000);
+
+  it('waits for delayed cross-TU indexing before treating empty incoming calls as coverage', async () => {
+    const db = database([entry('callee.c', 'shared', ['-DDELAY_INDEX']), entry('caller.c', 'shared')]);
+    const directory = materializeCompileView(root, buildCompileViews(db)[0]!);
+    const client = new ClangdClient(root, directory, { clangdPath: executable, queryDrivers: [] }, undefined, 2000);
+    const callee = pathToFileURL(path.join(root, 'callee.c')).href;
+    const caller = pathToFileURL(path.join(root, 'caller.c')).href;
+    try {
+      await client.start();
+      client.didOpen(callee, 'c', fs.readFileSync(path.join(root, 'callee.c'), 'utf8'));
+      client.didOpen(caller, 'c', fs.readFileSync(path.join(root, 'caller.c'), 'utf8'));
+      const [symbol] = await client.documentSymbols(callee);
+      if (!symbol || !('selectionRange' in symbol)) throw new Error('Fixture did not provide a hierarchical function symbol');
+      const [item] = await client.prepareCallHierarchy(callee, symbol.selectionRange.start);
+      expect(await client.incomingCalls(item!)).toEqual([]);
+      await client.waitForIndex();
+      expect(client.hasCleanDiagnostics(callee)).toBe(true);
+      expect(client.hasCleanDiagnostics(caller)).toBe(true);
+      expect((await client.incomingCalls(item!))[0]?.from.name).toBe('from_other');
+    } finally { await client.close(); }
+    const result = await collectCppSemanticFacts(root, db, { clangdPath: executable, queryDrivers: [] });
+    expect(result.views[0]?.success).toBe(true);
+    expect(result.views[0]?.coveredFiles).toEqual(['callee.c', 'caller.c']);
+    expect(result.calls.filter(c => c.callee.name === 'external_target'))
+      .toMatchObject([{ caller: { filePath: 'caller.c', name: 'from_other' }, callLine: 2, callColumn: 30 }]);
+  }, 10_000);
+
+  it('retains positive facts but rejects negative coverage without sync or with errors', async () => {
+    for (const flag of ['-DNO_SYNC', '-DDIAG_ERROR']) {
+      const db = database([entry('variant.c', 'one', [flag])]);
+      const result = await collectCppSemanticFacts(root, db, { clangdPath: executable, queryDrivers: [] });
+      expect(result.views[0]?.success).toBe(false);
+      expect(result.views[0]?.failedFiles).toEqual(['variant.c']);
+      expect(result.symbols.some(s => s.name === 'feature')).toBe(true);
+      expect(result.calls.some(c => c.callee.name === 'feature')).toBe(true);
+    }
+  });
+
+  it('treats warning-only diagnostics as a completed scope', async () => {
+    const db = database([entry('variant.c', 'one', ['-DDIAG_WARNING'])]);
+    const result = await collectCppSemanticFacts(root, db, { clangdPath: executable, queryDrivers: [] });
+    expect(result.views[0]?.success).toBe(true);
+    expect(result.views[0]?.coveredFiles).toEqual(['variant.c']);
+  });
+
+  it('limits diagnostic errors to the affected TU while retaining other covered files', async () => {
+    const db = database([entry('callee.c', 'shared'), entry('caller.c', 'shared', ['-DDIAG_ERROR'])]);
+    const result = await collectCppSemanticFacts(root, db, { clangdPath: executable, queryDrivers: [] });
+    expect(result.views[0]?.success).toBe(false);
+    expect(result.views[0]?.coveredFiles).toEqual(['callee.c']);
+    expect(result.views[0]?.failedFiles).toEqual(['caller.c']);
+    expect(result.calls.some(c => c.caller.filePath === 'caller.c')).toBe(true);
+  });
+
+  it('bounds a hung sync request and marks the affected view incomplete', async () => {
+    const db = database([entry('variant.c', 'good'), entry('variant.c', 'hung', ['-DHANG_SYNC'])]);
+    const started = Date.now();
+    const result = await collectCppSemanticFacts(root, db, { clangdPath: executable, queryDrivers: [] },
+      { requestTimeoutMs: 250 });
+    expect(Date.now() - started).toBeLessThan(3000);
+    expect(result.views.find(v => v.key === 'cmake:good')?.success).toBe(true);
+    expect(result.views.find(v => v.key === 'cmake:hung')?.success).toBe(false);
+    expect(result.views.find(v => v.key === 'cmake:hung')?.failedFiles).toEqual(['variant.c']);
+    expect(result.symbols.some(s => s.configId === result.views.find(v => v.key === 'cmake:good')?.id)).toBe(true);
+  });
 
   it('keeps positive facts and marks only the failed view incomplete', async () => {
     const db = database([entry('variant.c', 'good', ['-DVARIANT_ONE']),

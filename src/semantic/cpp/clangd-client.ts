@@ -32,6 +32,7 @@ export interface LspCallHierarchyItem {
 export interface LspIncomingCall { from: LspCallHierarchyItem; fromRanges: LspRange[] }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+const SYNC_TIMEOUT_MS = 65_000;
 const EXIT_WAIT_MS = 500;
 
 /**
@@ -67,6 +68,8 @@ export class ClangdClient {
   private initialized = false;
   private stopped = false;
   private readonly timeoutMs: number;
+  private readonly syncTimeoutMs: number;
+  private readonly documentErrors = new Map<string, boolean>();
 
   /**
    * @brief 建立惰性 clangd 客户端，仅接受用户侧已验证的运行时授权。
@@ -79,9 +82,11 @@ export class ClangdClient {
    */
   constructor(private readonly root: string, private readonly compileDirectory: string,
     private readonly runtime: CppSemanticRuntimeOptions, private readonly signal?: AbortSignal,
-    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
-    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('Invalid clangd request timeout');
-    this.timeoutMs = timeoutMs;
+    timeoutMs?: number) {
+    if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) throw new Error('Invalid clangd request timeout');
+    this.timeoutMs = timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    // clangd 自身等待最多 60 秒；显式短超时仍适用于调用方取消/测试。
+    this.syncTimeoutMs = Math.min(timeoutMs ?? SYNC_TIMEOUT_MS, SYNC_TIMEOUT_MS);
   }
 
   /**
@@ -105,6 +110,14 @@ export class ClangdClient {
       const connection = createMessageConnection(child.stdout, child.stdin);
       this.connection = connection;
       connection.onClose(() => { this.stopped = true; });
+      connection.onNotification('textDocument/publishDiagnostics', (value: unknown) => {
+        const params = value as { uri?: unknown; diagnostics?: unknown } | null;
+        if (typeof params?.uri !== 'string' || !Array.isArray(params.diagnostics)) return;
+        this.documentErrors.set(params.uri, params.diagnostics.some((diagnostic: unknown) => {
+          const severity = (diagnostic as { severity?: unknown } | null)?.severity;
+          return severity === undefined || severity === 1;
+        }));
+      });
       connection.listen();
       await this.request('initialize', { processId: process.pid, rootUri: pathToFileURL(this.root + '/').href,
         capabilities: { textDocument: { documentSymbol: { hierarchicalDocumentSymbolSupport: true },
@@ -122,13 +135,14 @@ export class ClangdClient {
    * @brief 发送单个有界 LSP 请求，超时或取消时使本视图失效。
    * @param[in] method LSP 方法名
    * @param[in] params 方法参数
+   * @param[in] timeoutMs 当前请求的等待上限
    * @return 服务端响应
    */
-  private async request<T>(method: string, params: object): Promise<T> {
+  private async request<T>(method: string, params: object, timeoutMs = this.timeoutMs): Promise<T> {
     if (!this.connection || this.stopped || this.signal?.aborted) throw new Error('clangd session stopped');
     const token = new CancellationTokenSource();
     try {
-      return await bounded(this.connection.sendRequest<T>(method, params, token.token), this.timeoutMs, this.signal,
+      return await bounded(this.connection.sendRequest<T>(method, params, token.token), timeoutMs, this.signal,
         () => { if (!this.stopped) token.cancel(); this.kill(); });
     } finally { token.dispose(); }
   }
@@ -142,7 +156,25 @@ export class ClangdClient {
    */
   didOpen(uri: string, languageId: string, text: string): void {
     if (!this.initialized || !this.connection || this.stopped) throw new Error('clangd session not initialized');
+    this.documentErrors.delete(uri);
     this.connection.sendNotification('textDocument/didOpen', { textDocument: { uri, languageId, version: 1, text } });
+  }
+
+  /**
+   * @brief 等待 clangd 19 测试扩展报告 TU、CDB 和后台索引均空闲。
+   * @return 无；不支持、超时、取消或服务端未空闲时抛出异常
+   */
+  async waitForIndex(): Promise<void> {
+    await this.request('sync', {}, this.syncTimeoutMs);
+  }
+
+  /**
+   * @brief 判定一个已打开文档是否收到无错误的最终诊断。
+   * @param[in] uri 已打开源文件的 file URI
+   * @return 诊断已发布且无错误时为 true；缺失或有错误时为 false
+   */
+  hasCleanDiagnostics(uri: string): boolean {
+    return this.documentErrors.get(uri) === false;
   }
 
   /**
@@ -173,15 +205,6 @@ export class ClangdClient {
    */
   async incomingCalls(item: LspCallHierarchyItem): Promise<LspIncomingCall[]> {
     return (await this.request<LspIncomingCall[] | null>('callHierarchy/incomingCalls', { item })) ?? [];
-  }
-
-  /**
-   * @brief 在需要跨文件身份检索时查询工作区符号。
-   * @param[in] query 符号名
-   * @return clangd 工作区符号结果
-   */
-  async workspaceSymbols(query: string): Promise<LspSymbolInformation[]> {
-    return (await this.request<LspSymbolInformation[] | null>('workspace/symbol', { query })) ?? [];
   }
 
   /**

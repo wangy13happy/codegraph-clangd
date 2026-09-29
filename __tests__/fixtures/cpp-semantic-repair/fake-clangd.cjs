@@ -12,6 +12,8 @@ const two = args.includes('-DVARIANT_TWO');
 const fail = args.includes('-DFAIL_VIEW');
 const hang = args.includes('-DHANG_VIEW');
 const hangInitialize = args.includes('-DHANG_INITIALIZE');
+const delayedIndex = args.includes('-DDELAY_INDEX');
+let indexReady = !delayedIndex;
 if (args.includes('-DEXIT_EARLY')) process.exit(2);
 const opened = new Map();
 let pending = Buffer.alloc(0);
@@ -27,6 +29,34 @@ function send(id, result, error) {
   const body = Buffer.from(JSON.stringify(error ? { jsonrpc: '2.0', id, error } : { jsonrpc: '2.0', id, result }));
   process.stdout.write(`Content-Length: ${body.length}\r\n\r\n`);
   process.stdout.write(body);
+}
+
+/**
+ * @brief 发送模拟的诊断通知。
+ * @param[in] uri 当前编译视图的源文件 URI
+ * @return 无
+ */
+function sendDiagnostics(uri) {
+  const file = fileURLToPath(uri);
+  const ownArgs = rows.find(row => path.resolve(row.file) === file)?.arguments ?? [];
+  const diagnostics = ownArgs.includes('-DDIAG_ERROR') ? [{ severity: 1, message: 'fixture parse error',
+    range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } }]
+    : ownArgs.includes('-DDIAG_WARNING') ? [{ severity: 2, message: 'fixture warning',
+      range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } } }] : [];
+  const body = Buffer.from(JSON.stringify({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics',
+    params: { uri, version: 1, diagnostics } }));
+  process.stdout.write(`Content-Length: ${body.length}\r\n\r\n`);
+  process.stdout.write(body);
+}
+
+/**
+ * @brief 模拟 clangd 的 sync 测试扩展等待另一 TU 索引完成。
+ * @param[in] id sync 请求 ID
+ * @return 无
+ */
+function respondWhenIdle(id) {
+  if (indexReady) send(id, null);
+  else setTimeout(() => respondWhenIdle(id), 10);
 }
 
 /**
@@ -69,6 +99,8 @@ function symbol(uri, name, text, startNeedle, endNeedle, detail) {
 function documentSymbols(uri) {
   const text = opened.get(uri);
   const file = path.basename(fileURLToPath(uri));
+  if (file === 'callee.c') return [symbol(uri, 'external_target', text, 'int external_target(void) {', '}', 'int external_target(void)')];
+  if (file === 'caller.c') return [symbol(uri, 'from_other', text, 'int from_other(void) {', '}', 'int from_other(void)')];
   if (file === 'variant.c') {
     const detail = two ? 'int feature(void)' : 'int feature(int value)';
     return [symbol(uri, 'feature', text, two ? 'int feature(void)' : 'int feature(int value)', '}', detail),
@@ -83,7 +115,14 @@ function documentSymbols(uri) {
  * @return 无
  */
 function handle(message) {
-  if (message.method === 'textDocument/didOpen') { opened.set(message.params.textDocument.uri, message.params.textDocument.text); return; }
+  if (message.method === 'textDocument/didOpen') {
+    const uri = message.params.textDocument.uri;
+    opened.set(uri, message.params.textDocument.text);
+    if (delayedIndex && path.basename(fileURLToPath(uri)) === 'caller.c') {
+      setTimeout(() => { indexReady = true; sendDiagnostics(uri); }, 600);
+    } else sendDiagnostics(uri);
+    return;
+  }
   if (message.method === 'initialized' || message.method === '$/cancelRequest') return;
   if (message.method === 'exit') { process.exit(0); return; }
   if (message.method === 'initialize') {
@@ -91,6 +130,11 @@ function handle(message) {
     return;
   }
   if (message.method === 'shutdown') { send(message.id, null); return; }
+  if (message.method === 'sync') {
+    if (args.includes('-DNO_SYNC')) send(message.id, null, { code: -32601, message: 'sync unsupported' });
+    else if (!args.includes('-DHANG_SYNC')) respondWhenIdle(message.id);
+    return;
+  }
   if (message.method === 'textDocument/documentSymbol') {
     if (hang) return;
     if (fail) { send(message.id, null, { code: -32603, message: 'fixture failure' }); return; }
@@ -102,13 +146,20 @@ function handle(message) {
   }
   if (message.method === 'callHierarchy/incomingCalls') {
     const target = message.params.item;
+    if (target.name === 'external_target') {
+      if (!indexReady) { send(message.id, []); return; }
+      const callerUri = [...opened.keys()].find(uri => path.basename(fileURLToPath(uri)) === 'caller.c');
+      const text = opened.get(callerUri);
+      const caller = symbol(callerUri, 'from_other', text, 'int from_other(void) {', '}', 'int from_other(void)');
+      const pos = position(text, 'external_target();');
+      send(message.id, [{ from: caller, fromRanges: [{ start: pos, end: pos }] }]); return;
+    }
     if (target.name !== 'feature') { send(message.id, []); return; }
     const text = opened.get(target.uri);
     const caller = symbol(target.uri, 'invoke', text, 'int invoke(void)', '}', 'int invoke(void)');
     const pos = position(text, two ? 'feature();' : 'feature(1);');
     send(message.id, [{ from: caller, fromRanges: [{ start: pos, end: pos }] }]); return;
   }
-  if (message.method === 'workspace/symbol') { send(message.id, []); return; }
   send(message.id, null, { code: -32601, message: 'method not found' });
 }
 
