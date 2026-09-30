@@ -8,7 +8,8 @@ import { QueryBuilder } from '../src/db/queries';
 import { generateNodeId, semanticCollisionNodeId } from '../src/extraction/tree-sitter-helpers';
 import { extractFromSource } from '../src/extraction/tree-sitter';
 import { initGrammars, loadGrammarsForLanguages } from '../src/extraction/grammars';
-import { reconcileCppSemanticNodes, reconcileCppStructuralMacros } from '../src/semantic/cpp/reconciler';
+import { reconcileCppSemanticNodes, reconcileCppStructuralMacros, reconcileCppStructuralTypedefs,
+  reconcileCppTypedefBindings } from '../src/semantic/cpp/reconciler';
 import { collectCppSemanticFacts, SemanticFactCollection } from '../src/semantic/cpp';
 import { createResolver } from '../src/resolution';
 import { Node } from '../src/types';
@@ -135,6 +136,38 @@ describe('C/C++ semantic node reconciliation', () => {
       size: 20000, modifiedAt: 1, indexedAt: 1, nodeCount: 0 });
     expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'])).toBe(1);
     expect(queries.getNodesByFile('vendor/sdk.h').map(node => node.name)).toEqual(['SDK_USED']);
+  });
+
+  it('keeps conditional callback typedef alternatives canonical and binds only verified views', async () => {
+    const source = '#ifndef EVENTS_H\n#define EVENTS_H\n#if defined(FEATURE_OLD)\ntypedef void (*EventCallback)(int);\n#else\n' +
+      'typedef void (*EventCallback)(int, const char *);\n#endif\n#endif\n';
+    fs.writeFileSync(path.join(directory, 'events.h'), source);
+    const extracted = extractFromSource('events.h', source, 'c');
+    for (const node of extracted.nodes) queries.insertNode(node);
+    const contexts = await reconcileCppStructuralTypedefs(directory, queries);
+    expect(contexts).toHaveLength(2);
+    expect(contexts.map(context => context.name)).toEqual(['EventCallback', 'EventCallback']);
+    expect(contexts.map(context => [context.startLine, context.sourceStartLine, context.sourceEndLine]))
+      .toEqual([[4, 3, 7], [6, 3, 7]]);
+    expect(contexts[0]!.conditions).toEqual(['#ifndef EVENTS_H', '#if defined(FEATURE_OLD)']);
+    expect(contexts[1]!.conditions).toEqual(['#ifndef EVENTS_H', '#if defined(FEATURE_OLD)', '#else']);
+    const snapshot = collection(['new'], []);
+    reconcileCppSemanticNodes(conn.getDb(), queries, snapshot);
+    snapshot.typedefBindings = [{ nodeId: contexts[1]!.nodeId, configId: 'new' }];
+    reconcileCppTypedefBindings(conn.getDb(), queries, snapshot, contexts);
+    expect(conn.getDb().prepare('SELECT node_id FROM semantic_node_configs').all())
+      .toEqual([{ node_id: contexts[1]!.nodeId }]);
+    snapshot.views[0]!.success = false;
+    snapshot.typedefBindings = [];
+    reconcileCppTypedefBindings(conn.getDb(), queries, snapshot, contexts);
+    expect(conn.getDb().prepare('SELECT node_id FROM semantic_node_configs').all())
+      .toEqual([{ node_id: contexts[1]!.nodeId }]);
+    expect(JSON.parse(queries.getMetadata(`cpp_typedef:${contexts[1]!.nodeId}`)!)).toMatchObject({confirmedConfigIds:[]});
+    snapshot.views[0]!.success = true;
+    snapshot.typedefBindings = [{ nodeId: contexts[0]!.nodeId, configId: 'new' }];
+    reconcileCppTypedefBindings(conn.getDb(), queries, snapshot, contexts);
+    expect(conn.getDb().prepare('SELECT node_id FROM semantic_node_configs').all())
+      .toEqual([{ node_id: contexts[0]!.nodeId }]);
   });
 
   it('merges conditional signatures and their shared body into one identity', () => {

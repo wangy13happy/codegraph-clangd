@@ -30,6 +30,7 @@ export interface LspCallHierarchyItem {
   detail?: string;
 }
 export interface LspIncomingCall { from: LspCallHierarchyItem; fromRanges: LspRange[] }
+export interface LspDefinition { uri: string; range: LspRange }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_SYNC_TIMEOUT_MS = 10 * 60_000;
@@ -185,6 +186,18 @@ export class ClangdClient {
   async documentSymbols(uri: string): Promise<Array<LspDocumentSymbol | LspSymbolInformation>> {
     return (await this.request<Array<LspDocumentSymbol | LspSymbolInformation> | null>(
       'textDocument/documentSymbol', { textDocument: { uri } })) ?? [];
+  }
+
+  /**
+   * @brief 查询实际源码引用绑定的定义位置，不按符号名字猜测目标。
+   * @param[in] uri 引用所在文件 URI
+   * @param[in] position 引用的 LSP 坐标
+   * @return clangd 解析的定义位置；无定义时返回空数组
+   */
+  async definitions(uri: string, position: LspPosition): Promise<LspDefinition[]> {
+    const result = await this.request<LspDefinition | LspDefinition[] | null>('textDocument/definition',
+      { textDocument: { uri }, position });
+    return result ? Array.isArray(result) ? result : [result] : [];
   }
 
   /**

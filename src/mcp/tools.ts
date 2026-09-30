@@ -6276,7 +6276,12 @@ export class ToolHandler {
         code = await cg.getCode(node.id);
       }
     }
-    return this.formatNodeDetails(node, code, outline) + this.formatTrail(cg, node);
+    const typedef = node.kind === 'type_alias' ? cg.getCppTypedefContext(node.id) : null;
+    const conditions = typedef ? `\n\n**Conditions:** ${typedef.conditions.join(' / ') || 'unconditional'}\n` +
+      `**Binding:** ${typedef.activeConfigIds.length ? 'clangd observed in ' + typedef.activeConfigIds.join(', ') :
+        'unknown (structural alternative; no confirmed compile-view binding)'}` +
+      (typedef.retainedConfigIds.length ? `\n**Retained evidence:** ${typedef.retainedConfigIds.join(', ')} (not confirmed in this collection)` : '') : '';
+    return this.formatNodeDetails(node, code, outline, typedef?.sourceStartLine) + conditions + this.formatTrail(cg, node);
   }
 
   // Whole-file fallback caps for a drifted file (#1474): small enough to fit
@@ -7010,7 +7015,15 @@ export class ToolHandler {
     return lines.join('\n');
   }
 
-  private formatNodeDetails(node: Node, code: string | null, outline?: string | null): string {
+  /**
+   * @brief 格式化符号身份及源码；条件声明上下文使用独立真实起始行。
+   * @param[in] node 图中的真实声明或定义节点
+   * @param[in] code 完整源码或空值
+   * @param[in] outline 容器结构摘要
+   * @param[in] sourceStartLine 条件上下文源码起始行；省略时使用声明位置
+   * @return 带真实行号和声明位置的 Markdown 正文
+   */
+  private formatNodeDetails(node: Node, code: string | null, outline?: string | null, sourceStartLine?: number): string {
     const location = node.startLine ? `:${node.startLine}` : '';
     const lines: string[] = [
       `**${node.name}** (${node.kind})`,
@@ -7033,7 +7046,7 @@ export class ToolHandler {
     } else if (code) {
       // Line-numbered (cat -n style, like codegraph_explore and Read) so the
       // agent can cite/edit exact lines without re-Reading the file for them.
-      const numbered = node.startLine ? numberSourceLines(code, node.startLine) : code;
+      const numbered = node.startLine ? numberSourceLines(code, sourceStartLine ?? node.startLine) : code;
       lines.push('', '```' + node.language, numbered, '```');
     }
 

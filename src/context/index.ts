@@ -1241,6 +1241,18 @@ export class ContextBuilder {
       return null;
     }
 
+    if (node.kind === 'type_alias') {
+      const raw = this.queries.getMetadata(`cpp_typedef:${nodeId}`);
+      if (raw) {
+        try {
+          const context = JSON.parse(raw) as { sourceStartLine?: number; sourceEndLine?: number };
+          if (Number.isSafeInteger(context.sourceStartLine) && Number.isSafeInteger(context.sourceEndLine) &&
+              context.sourceStartLine! > 0 && context.sourceStartLine! <= node.startLine &&
+              context.sourceEndLine! >= node.endLine) return this.extractNodeCode({ ...node,
+                startLine: context.sourceStartLine!, endLine: context.sourceEndLine! });
+        } catch { /* 失效元数据仅降级到既有声明范围。 */ }
+      }
+    }
     return this.extractNodeCode(node);
   }
 

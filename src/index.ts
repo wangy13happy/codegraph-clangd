@@ -56,7 +56,9 @@ import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
 import { loadDeprioritizePatterns } from './project-config';
 import { collectCppSemanticFacts, resolveCppSemanticInputs, CppSemanticInputs } from './semantic/cpp';
-import { reconcileCppSemanticNodes, reconcileCppStructuralMacros } from './semantic/cpp/reconciler';
+import { reconcileCppSemanticNodes, reconcileCppStructuralMacros, reconcileCppStructuralTypedefs,
+  reconcileCppTypedefBindings } from './semantic/cpp/reconciler';
+import { StructuralTypedefContext } from './semantic/cpp/facts';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
@@ -495,9 +497,13 @@ export class CodeGraph {
       callsRepositioned: 0, viewsFailed: 0, durationMs: 0 };
     try {
       if (inputs.error || !inputs.database || !inputs.fingerprint) throw new Error(inputs.error ?? 'semantic inputs unavailable');
+      const typedefStarted = Date.now();
+      const typedefCandidates = await reconcileCppStructuralTypedefs(this.projectRoot, this.queries);
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
+        `[semantic-timing] structural-typedefs: ${Date.now() - typedefStarted}ms facts=${typedefCandidates.length}`);
       const collectionStarted = Date.now();
       const facts = await collectCppSemanticFacts(this.projectRoot, inputs.database, inputs.runtime,
-        { scopeFiles, signal });
+        { scopeFiles, signal, typedefCandidates });
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
         `[semantic-timing] all-views: ${Date.now() - collectionStarted}ms views=${facts.views.length}`);
       status.viewCount = facts.views.length;
@@ -508,6 +514,7 @@ export class CodeGraph {
           view.id === id && view.success && view.coveredFiles.includes(file))));
       const nodeTransactionStarted = Date.now();
       const repaired = reconcileCppSemanticNodes(this.db.getDb(), this.queries, facts);
+      reconcileCppTypedefBindings(this.db.getDb(), this.queries, facts, typedefCandidates);
       // 宏的源码结构不等同于编译视图绑定；仅 opt-in 修复路径存独立来源。
       const macrosStarted = Date.now();
       const macrosAdded = await reconcileCppStructuralMacros(this.projectRoot, this.db.getDb(), this.queries,
@@ -2014,6 +2021,30 @@ export class CodeGraph {
    */
   async getCode(nodeId: string): Promise<string | null> {
     return this.contextBuilder.getCode(nodeId);
+  }
+
+  /**
+   * @brief 查询 opt-in 函数指针 typedef 的结构条件及已由引用确认的配置归属。
+   * @param[in] nodeId 既有 typedef 图节点身份
+   * @return 条件源码上下文和真实绑定配置；无结构事实或无效数据时返回 null
+   */
+  getCppTypedefContext(nodeId: string): (StructuralTypedefContext & {
+    activeConfigIds: string[]; retainedConfigIds: string[] }) | null {
+    const node = this.queries.getNodeById(nodeId);
+    const raw = this.queries.getMetadata(`cpp_typedef:${nodeId}`);
+    if (!node || node.kind !== 'type_alias' || !raw) return null;
+    try {
+      const context = JSON.parse(raw) as StructuralTypedefContext;
+      if (context.nodeId !== nodeId || context.filePath !== node.filePath || context.name !== node.name ||
+          !Number.isSafeInteger(context.sourceStartLine) || context.sourceStartLine < 1 ||
+          !Number.isSafeInteger(context.sourceEndLine) || context.sourceEndLine < node.endLine ||
+          !Array.isArray(context.conditions) || context.conditions.some(condition => typeof condition !== 'string')) return null;
+      const rows = this.db.getDb().prepare('SELECT config_id FROM semantic_node_configs WHERE node_id = ? ORDER BY config_id')
+        .all(nodeId) as Array<{ config_id: string }>;
+      const confirmed = new Set(context.confirmedConfigIds ?? []);
+      return { ...context, activeConfigIds: rows.filter(row => confirmed.has(row.config_id)).map(row => row.config_id),
+        retainedConfigIds: rows.filter(row => !confirmed.has(row.config_id)).map(row => row.config_id) };
+    } catch { return null; }
   }
 
   /**

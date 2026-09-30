@@ -9,7 +9,134 @@ import { generateNodeId, semanticCollisionNodeId } from '../../extraction/tree-s
 import { Node } from '../../types';
 import { isWithinProject } from './compile-database';
 import { SemanticFactCollection } from './index';
-import { SemanticSymbolFact, semanticRangesOverlap, assertPairwiseSemanticOverlap } from './facts';
+import { SemanticSymbolFact, semanticRangesOverlap, assertPairwiseSemanticOverlap,
+  StructuralTypedefContext } from './facts';
+
+/**
+ * @brief 从既有函数指针 typedef 节点恢复规范名称、条件源码范围，不推断生效分支。
+ * @param[in] root 项目真实根目录
+ * @param[in] queries 图读写接口；保留既有节点 ID 及关系
+ * @return 可供真实 TU definition 引用核验的结构声明清单
+ */
+export async function reconcileCppStructuralTypedefs(root: string, queries: QueryBuilder):
+  Promise<StructuralTypedefContext[]> {
+  await loadGrammarsForLanguages(['c']);
+  const parser = getParser('c');
+  if (!parser) return [];
+  const aliases = queries.getNodesByKind('type_alias').filter(node =>
+    (node.language === 'c' || node.language === 'cpp') && /\.(?:h|hh|hpp|hxx)$/i.test(node.filePath));
+  const contexts: StructuralTypedefContext[] = [];
+  for (const file of new Set(aliases.map(node => node.filePath))) {
+    let source: string;
+    try {
+      const real = fs.realpathSync(path.join(root, file));
+      if (!isWithinProject(root, real)) continue;
+      source = fs.readFileSync(real, 'utf8');
+    } catch { continue; }
+    const tree = parser.parse(source);
+    if (!tree) continue;
+    const lines = source.split('\n');
+    /**
+     * @brief 仅沿声明器链取函数指针名称并记录真实预处理祖先，不解释条件表达式。
+     * @param[in] syntax 当前语法节点
+     * @return 无；完整且唯一对应已有节点的声明才进入清单
+     */
+    const visit = (syntax: SyntaxNode): void => {
+      if (syntax.type === 'type_definition') {
+        let declarator = syntax.childForFieldName('declarator');
+        let functionPointer = false;
+        let functionDeclarator = false;
+        while (declarator && declarator.type !== 'type_identifier' && declarator.type !== 'identifier') {
+          functionPointer ||= declarator.type === 'pointer_declarator';
+          functionDeclarator ||= declarator.type === 'function_declarator';
+          declarator = declarator.childForFieldName('declarator') ?? declarator.namedChild(0);
+        }
+        if (functionPointer && functionDeclarator && declarator) {
+          const matches = aliases.filter(node => node.filePath === file &&
+            node.startLine === syntax.startPosition.row + 1 && node.endLine === syntax.endPosition.row + 1);
+          if (matches.length === 1) {
+            const node = matches[0]!;
+            let sourceStartLine = node.startLine;
+            let sourceEndLine = node.endLine;
+            let sourceConditionFound = false;
+            const conditions: string[] = [];
+            for (let ancestor = syntax.parent; ancestor; ancestor = ancestor.parent) {
+              if (['preproc_if', 'preproc_ifdef', 'preproc_elif', 'preproc_else'].includes(ancestor.type)) {
+                conditions.unshift(lines[ancestor.startPosition.row]?.trim() ?? ancestor.type);
+                // 最近的完整条件组包含两条 alternatives；外层 include guard 只记条件，
+                // 不扩大正文到整份头文件，否则会挤掉真正需要查询的声明。
+                if (!sourceConditionFound && (ancestor.type === 'preproc_if' || ancestor.type === 'preproc_ifdef')) {
+                  sourceConditionFound = true;
+                  sourceStartLine = ancestor.startPosition.row + 1;
+                  sourceEndLine = ancestor.endPosition.row + (ancestor.endPosition.column === 0 ? 0 : 1);
+                }
+              }
+            }
+            const context: StructuralTypedefContext = { nodeId: node.id, filePath: file,
+              name: declarator.text, startLine: node.startLine, endLine: node.endLine,
+              sourceStartLine, sourceEndLine, conditions };
+            try {
+              const previous = JSON.parse(queries.getMetadata(`cpp_typedef:${node.id}`) ?? '{}') as StructuralTypedefContext;
+              if (previous.name === context.name && previous.startLine === context.startLine &&
+                  previous.endLine === context.endLine) context.confirmedConfigIds = previous.confirmedConfigIds;
+            } catch { /* 未确认的旧结构不能补充生效配置。 */ }
+            // 结构规范化不改变 baseline ID，也不创建虚构 compile view。
+            if (node.name !== context.name) queries.updateNode({ ...node,
+              name: context.name, qualifiedName: context.name, updatedAt: Date.now() });
+            queries.setMetadata(`cpp_typedef:${node.id}`, JSON.stringify(context));
+            contexts.push(context);
+          }
+        }
+      }
+      for (const child of syntax.namedChildren) visit(child);
+    };
+    visit(tree.rootNode);
+    tree.delete();
+  }
+  return contexts;
+}
+
+/**
+ * @brief 对账 definition 实际确认的 typedef 视图归属，并保留 partial/advisory 历史证据。
+ * @param[in] db 已配置外键的图数据库
+ * @param[in] queries 节点查询与元数据接口
+ * @param[in] collection 当前 clangd 编译视图与绑定事实
+ * @param[in] contexts 本轮完整结构声明候选
+ * @return 无；只接受真实节点及当前配置中的正向绑定
+ */
+export function reconcileCppTypedefBindings(db: SqliteDatabase, queries: QueryBuilder,
+  collection: SemanticFactCollection, contexts: StructuralTypedefContext[]): void {
+  const candidates = new Map(contexts.map(context => [context.nodeId, context]));
+  db.transaction(() => {
+    for (const view of collection.views) {
+      if (collection.inventory !== 'authoritative' || view.inventory !== 'authoritative' || !view.success) continue;
+      for (const context of contexts) db.prepare(
+        'DELETE FROM semantic_node_configs WHERE node_id = ? AND config_id = ?').run(context.nodeId, view.id);
+    }
+    for (const binding of collection.typedefBindings ?? []) {
+      const context = candidates.get(binding.nodeId);
+      if (!context || !queries.getNodeById(binding.nodeId) || !collection.views.some(view => view.id === binding.configId))
+        throw new Error('Invalid C/C++ typedef binding');
+      db.prepare(`INSERT INTO semantic_node_configs (node_id,config_id,signature,definition_line,definition_col)
+        VALUES (?,?,?,?,?) ON CONFLICT(node_id,config_id) DO UPDATE SET
+          signature=excluded.signature,definition_line=excluded.definition_line,definition_col=excluded.definition_col`)
+        .run(binding.nodeId, binding.configId, queries.getNodeById(binding.nodeId)?.signature ?? null,
+          context.startLine, queries.getNodeById(binding.nodeId)?.startColumn ?? 0);
+    }
+    for (const context of contexts) {
+      const observed = new Set((collection.typedefBindings ?? []).filter(binding => binding.nodeId === context.nodeId)
+        .map(binding => binding.configId));
+      if (collection.scopeFiles) for (const id of context.confirmedConfigIds ?? []) {
+        if (!collection.views.some(view => view.id === id)) observed.add(id);
+      }
+      queries.setMetadata(`cpp_typedef:${context.nodeId}`, JSON.stringify({ ...context,
+        confirmedConfigIds: [...observed].sort() }));
+    }
+    // 已删除声明的元数据不能在下一轮被重新查询；不触碰其他 project_metadata。
+    db.prepare(`DELETE FROM project_metadata WHERE substr(key,1,12) = 'cpp_typedef:' AND
+      NOT EXISTS (SELECT 1 FROM nodes WHERE id = substr(project_metadata.key,13))`).run();
+  })();
+}
 
 /**
  * @brief 为编译 TU 直接包含且实际使用的本地头文件宏保存完整结构范围。

@@ -94,6 +94,20 @@ export interface SemanticCallFact {
   callColumn: number;
 }
 
+export interface StructuralTypedefContext {
+  nodeId: string;
+  filePath: string;
+  name: string;
+  startLine: number;
+  endLine: number;
+  sourceStartLine: number;
+  sourceEndLine: number;
+  conditions: string[];
+  confirmedConfigIds?: string[];
+}
+
+export interface SemanticTypedefBinding { nodeId: string; configId: string }
+
 export type SemanticSourceLines = Map<string, string[]>;
 
 /**

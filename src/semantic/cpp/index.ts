@@ -10,7 +10,10 @@ import { CompilationDatabase, loadCompilationDatabase } from './compile-database
 import { ClangdClient } from './clangd-client';
 import { buildCompileViews, CompileView, materializeCompileView } from './compile-views';
 import { documentSymbolFacts, incomingCallFacts, SemanticCallFact, SemanticSymbolFact,
-  SemanticSourceLines, symbolIdentity } from './facts';
+  SemanticSourceLines, symbolIdentity, StructuralTypedefContext, SemanticTypedefBinding,
+  projectFileFromUri } from './facts';
+import { getParser } from '../../extraction/grammars';
+import type { Node as SyntaxNode } from 'web-tree-sitter';
 
 export { buildCompileViews, materializeCompileView } from './compile-views';
 export { projectFileFromUri } from './facts';
@@ -40,6 +43,7 @@ export interface SemanticFactCollection {
   grouping: 'cmake-target' | 'semantic-flags';
   symbols: SemanticSymbolFact[];
   calls: SemanticCallFact[];
+  typedefBindings?: SemanticTypedefBinding[];
   views: SemanticViewResult[];
   /** 仅定向同步时提供；不能把未采集视图当作缺失证据。 */
   scopeFiles?: string[];
@@ -55,7 +59,7 @@ export interface CppSemanticInputs {
   error?: string;
 }
 
-const REPAIR_ALGORITHM_VERSION = 2;
+const REPAIR_ALGORITHM_VERSION = 3;
 
 /**
  * @brief 在可信用户侧运行时解析语义输入并散列修复算法、工具、数据库原始字节与配置。
@@ -100,11 +104,13 @@ export function resolveCppSemanticInputs(projectRoot: string): CppSemanticInputs
  * @param[in] runtime 仅用户侧授权的 clangd 路径和 query-driver 白名单
  * @param[in] signal 索引取消信号
  * @param[in] requestTimeoutMs 每请求超时毫秒数
+ * @param[in] typedefCandidates 已有结构函数指针声明，只能通过真实 TU 引用确认绑定
  * @return 此视图的正向事实、精确覆盖范围与失败诊断
  */
 async function collectView(root: string, view: CompileView, runtime: CppSemanticRuntimeOptions,
-  signal?: AbortSignal, requestTimeoutMs?: number): Promise<{
+  signal?: AbortSignal, requestTimeoutMs?: number, typedefCandidates: StructuralTypedefContext[] = []): Promise<{
     status: SemanticViewResult; symbols: SemanticSymbolFact[]; calls: SemanticCallFact[];
+    typedefBindings: SemanticTypedefBinding[];
   }> {
   const started = Date.now();
   const files = [...new Set(view.entries.map(e => e.file))].sort();
@@ -112,6 +118,9 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
   const covered: string[] = [];
   const symbols: SemanticSymbolFact[] = [];
   const calls: SemanticCallFact[] = [];
+  const typedefBindings: SemanticTypedefBinding[] = [];
+  let typedefRequests = 0;
+  let typedefRequestElapsedMs = 0;
   const sourceLines: SemanticSourceLines = new Map();
   let materializeMs = 0;
   let startupMs = 0;
@@ -176,6 +185,52 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
       if (!discovered) continue;
       try {
         let complete = indexReady;
+        const candidateNames = new Set(typedefCandidates.map(candidate => candidate.name));
+        const parser = getParser('c');
+        const lines = sourceLines.get(file)!;
+        const tree = candidateNames.size && parser ? parser.parse(lines.join('\n')) : null;
+        const positions: Array<{ name: string; line: number; character: number }> = [];
+        /**
+         * @brief 从真实 TU 中取结构类型引用候选，绑定必须另由 clangd definition 证实。
+         * @param[in] syntax 当前 Tree-sitter 节点
+         * @return 无；预算只允许每视图最多 512 个定义请求，超限降级为 partial
+         */
+        const collectTypes = (syntax: SyntaxNode): void => {
+          if (syntax.type === 'type_identifier' && candidateNames.has(syntax.text) && positions.length <= 512) {
+            positions.push({ name: syntax.text, line: syntax.startPosition.row,
+              character: Buffer.from(lines[syntax.startPosition.row] ?? '', 'utf8')
+                .subarray(0, syntax.startPosition.column).toString('utf8').length });
+          }
+          for (const child of syntax.namedChildren) collectTypes(child);
+        };
+        if (tree) { collectTypes(tree.rootNode); tree.delete(); }
+        else if (candidateNames.size) complete = false;
+        for (const position of positions) {
+          if (typedefRequests >= 512 || typedefRequestElapsedMs >= 5000) {
+            complete = false; error ??= 'typedef definition request budget exceeded'; break;
+          }
+          typedefRequests++;
+          const requestStarted = Date.now();
+          try {
+            const definitions = await client.definitions(uri, position);
+            if (!definitions.length) continue;
+            const resolved = new Set<string>();
+            for (const definition of definitions) {
+              const targetFile = projectFileFromUri(root, definition.uri);
+              const line = definition.range?.start?.line;
+              if (!Number.isSafeInteger(line)) continue;
+              const candidates = typedefCandidates.filter(candidate => candidate.filePath === targetFile &&
+                candidate.name === position.name && line + 1 >= candidate.startLine && line + 1 <= candidate.endLine);
+              if (candidates.length === 1) resolved.add(candidates[0]!.nodeId);
+            }
+            if (resolved.size === 1) typedefBindings.push({ nodeId: [...resolved][0]!, configId: view.id });
+            else if (resolved.size > 1) { complete = false; error ??= 'ambiguous typedef definition'; }
+          } catch (failure) { complete = false; error ??= String(failure); }
+          finally {
+            typedefRequestElapsedMs += Date.now() - requestStarted;
+            if (typedefRequestElapsedMs >= 5000) { complete = false; error ??= 'typedef definition request budget exceeded'; }
+          }
+        }
         for (const { fact, position } of discovered) {
           try {
             const items = await client.prepareCallHierarchy(uri, position);
@@ -237,7 +292,8 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
     inventory: view.inventory, grouping: view.grouping,
     success: failed.size === 0 && !error && !signal?.aborted,
     coveredFiles: covered, failedFiles: [...failed].sort(), analyzedTuCount: covered.length,
-    failedTuCount: failed.size, durationMs: Date.now() - started, ...(error ? { error } : {}) }, symbols, calls };
+    failedTuCount: failed.size, durationMs: Date.now() - started, ...(error ? { error } : {}) }, symbols, calls,
+    typedefBindings };
 }
 
 /**
@@ -250,11 +306,12 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
  */
 export async function collectCppSemanticFacts(projectRoot: string, database: CompilationDatabase,
   runtime: CppSemanticRuntimeOptions, options: { signal?: AbortSignal; requestTimeoutMs?: number;
-    scopeFiles?: string[] } = {}):
+    scopeFiles?: string[]; typedefCandidates?: StructuralTypedefContext[] } = {}):
   Promise<SemanticFactCollection> {
   const root = fs.realpathSync(projectRoot);
   const symbols: SemanticSymbolFact[] = [];
   const calls: SemanticCallFact[] = [];
+  const typedefBindings: SemanticTypedefBinding[] = [];
   const views: SemanticViewResult[] = [];
   const viewBuildStarted = Date.now();
   const compileViews = buildCompileViews(database);
@@ -267,11 +324,12 @@ export async function collectCppSemanticFacts(projectRoot: string, database: Com
   }
   for (const view of compileViews) {
     if (selected && !view.entries.some(entry => selected.has(entry.file))) continue;
-    const result = await collectView(root, view, runtime, options.signal, options.requestTimeoutMs);
+    const result = await collectView(root, view, runtime, options.signal, options.requestTimeoutMs, options.typedefCandidates);
     views.push(result.status);
     symbols.push(...result.symbols);
     calls.push(...result.calls);
+    typedefBindings.push(...result.typedefBindings);
   }
-  return { inventory: database.inventory, grouping: database.grouping, symbols, calls, views,
+  return { inventory: database.inventory, grouping: database.grouping, symbols, calls, views, typedefBindings,
     ...(selected ? { scopeFiles: [...selected], expectedViewsByFile } : {}) };
 }
