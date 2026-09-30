@@ -198,6 +198,9 @@ export interface CppSemanticRuntimeOptions {
   queryDrivers: string[];
   /** 仅来自用户侧授权，允许选择根目录外的编译数据库。 */
   compileCommands?: string;
+  /** 原生宏调用出口仅使用固定系统运行时或用户侧绝对路径；项目配置不授予此权限。 */
+  nativePythonPath?: string | null;
+  nativeLibclangPath?: string | null;
 }
 
 /**
@@ -305,7 +308,29 @@ export function resolveCppSemanticRuntimeOptions(
       compileCommands = fs.realpathSync(resolved);
     } catch { logWarn('Ignoring invalid trusted compile-commands override'); }
   }
-  return { clangdPath, queryDrivers, compileCommands };
+  /**
+   * @brief 解析原生出口运行时，拒绝项目内或非普通文件的隐式执行路径。
+   * @param[in] selected 用户侧绝对路径；未指定时仅检查固定系统候选
+   * @param[in] candidates 固定安装位置，不查询项目 PATH
+   * @param[in] executable 是否需要执行权限
+   * @return 规范路径；显式非法或系统依赖缺失时返回 null
+   */
+  const nativePath = (selected: string | undefined, candidates: string[], executable: boolean): string | null => {
+    for (const candidate of selected === undefined ? candidates : [selected]) {
+      try {
+        if (!path.isAbsolute(candidate) || !fs.statSync(candidate).isFile()) continue;
+        const real = fs.realpathSync(candidate);
+        if (projectRoot && isWithinProject(fs.realpathSync(projectRoot), real)) continue;
+        fs.accessSync(real, executable ? fs.constants.X_OK : fs.constants.R_OK);
+        return real;
+      } catch { /* 固定运行时不可用时保留 clangd 路径并明确降级 native 能力。 */ }
+    }
+    return null;
+  };
+  return { clangdPath, queryDrivers, compileCommands,
+    nativePythonPath: nativePath(env.CODEGRAPH_NATIVE_PYTHON_PATH, ['/usr/bin/python3'], true),
+    nativeLibclangPath: nativePath(env.CODEGRAPH_LIBCLANG_PATH,
+      ['/usr/lib/x86_64-linux-gnu/libclang-19.so.19', '/usr/lib/aarch64-linux-gnu/libclang-19.so.19'], false) };
 }
 
 /**

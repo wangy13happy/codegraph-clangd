@@ -55,9 +55,10 @@ import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
 import { loadDeprioritizePatterns } from './project-config';
-import { collectCppSemanticFacts, resolveCppSemanticInputs, CppSemanticInputs } from './semantic/cpp';
+import { collectCppSemanticFacts, resolveCppSemanticInputs, fingerprintCppNativeDeclarations,
+  CppSemanticInputs } from './semantic/cpp';
 import { reconcileCppSemanticNodes, reconcileCppStructuralMacros, reconcileCppStructuralTypedefs,
-  reconcileCppTypedefBindings } from './semantic/cpp/reconciler';
+  reconcileCppTypedefBindings, invalidateCppNativeDeclarations } from './semantic/cpp/reconciler';
 import { StructuralTypedefContext } from './semantic/cpp/facts';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
@@ -150,6 +151,7 @@ export interface CppSemanticRepairStatus {
   viewsFailed: number;
   durationMs: number;
   reason?: string;
+  native?: { attemptedTus: number; failedTus: number; durationMs: number; bytes: number; visited: number; reasons: string[] };
 }
 
 /**
@@ -497,18 +499,33 @@ export class CodeGraph {
       callsRepositioned: 0, viewsFailed: 0, durationMs: 0 };
     try {
       if (inputs.error || !inputs.database || !inputs.fingerprint) throw new Error(inputs.error ?? 'semantic inputs unavailable');
+      invalidateCppNativeDeclarations(this.db.getDb(), this.queries, this.projectRoot);
       const typedefStarted = Date.now();
       const typedefCandidates = await reconcileCppStructuralTypedefs(this.projectRoot, this.queries);
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
         `[semantic-timing] structural-typedefs: ${Date.now() - typedefStarted}ms facts=${typedefCandidates.length}`);
+      const macroScan = { nodes: [] as Node[], complete: true, scannedNodes: 0, sourceBytes: 0, reasons: [] as string[] };
+      const macrosStarted = Date.now();
+      const macrosAdded = await reconcileCppStructuralMacros(this.projectRoot, this.db.getDb(), this.queries,
+        inputs.database.entries.map(entry => entry.file), false, macroScan, inputs.database.includeDirectories);
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
+        `[semantic-timing] structural-macros: ${Date.now() - macrosStarted}ms added=${macrosAdded} candidates=${macroScan.nodes.length} complete=${macroScan.complete} nodes=${macroScan.scannedNodes} bytes=${macroScan.sourceBytes} reasons=${JSON.stringify(macroScan.reasons)}`);
       const collectionStarted = Date.now();
       const facts = await collectCppSemanticFacts(this.projectRoot, inputs.database, inputs.runtime,
-        { scopeFiles, signal, typedefCandidates });
+        { scopeFiles, signal, typedefCandidates, macroCandidates: macroScan.nodes, macroScanComplete: macroScan.complete });
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
         `[semantic-timing] all-views: ${Date.now() - collectionStarted}ms views=${facts.views.length}`);
       status.viewCount = facts.views.length;
       status.translationUnits = facts.views.reduce((total, view) => total + view.analyzedTuCount, 0);
       status.viewsFailed = facts.views.filter(view => !view.success).length;
+      if (facts.views.some(view => view.native)) status.native = facts.views.reduce((total, view) => {
+        if (view.native) {
+          total.attemptedTus += view.native.attemptedTus; total.failedTus += view.native.failedTus;
+          total.durationMs += view.native.durationMs; total.bytes += view.native.bytes; total.visited += view.native.visited;
+          total.reasons.push(...view.native.reasons);
+        }
+        return total;
+      }, { attemptedTus: 0, failedTus: 0, durationMs: 0, bytes: 0, visited: 0, reasons: [] as string[] });
       const missingScopedViews = !!scopeFiles && scopeFiles.some(file =>
         (facts.expectedViewsByFile?.[file] ?? []).some(id => !facts.views.some(view =>
           view.id === id && view.success && view.coveredFiles.includes(file))));
@@ -516,12 +533,12 @@ export class CodeGraph {
       const repaired = reconcileCppSemanticNodes(this.db.getDb(), this.queries, facts);
       reconcileCppTypedefBindings(this.db.getDb(), this.queries, facts, typedefCandidates);
       // 宏的源码结构不等同于编译视图绑定；仅 opt-in 修复路径存独立来源。
-      const macrosStarted = Date.now();
-      const macrosAdded = await reconcileCppStructuralMacros(this.projectRoot, this.db.getDb(), this.queries,
-        inputs.database.entries.map(entry => entry.file), facts.inventory === 'authoritative' &&
-          facts.views.every(view => view.success && view.inventory === 'authoritative'));
-      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
-        `[semantic-timing] structural-macros: ${Date.now() - macrosStarted}ms added=${macrosAdded}`);
+      if (macroScan.complete && facts.inventory === 'authoritative' && facts.views.every(view => view.success && view.inventory === 'authoritative')) {
+        const retainedMacros = new Set(macroScan.nodes.map(node => node.id));
+        for (const node of this.queries.getNodesByKind('constant')) {
+          if (node.semanticOrigin === 'source-structure' && !retainedMacros.has(node.id)) this.queries.deleteNode(node.id);
+        }
+      }
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
         `[semantic-timing] node-reconciliation: ${Date.now() - nodeTransactionStarted}ms`);
       status.nodesAdded = repaired.nodesAdded + macrosAdded;
@@ -537,11 +554,27 @@ export class CodeGraph {
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
         `[semantic-timing] call-reconciliation: ${Date.now() - callTransactionStarted}ms`);
       status.callsAdded = edges.added;
-      status.state = status.viewsFailed || missingScopedViews ? 'partial' : 'complete';
-      this.queries.setMetadata('semantic_repair_attempt_fingerprint', inputs.fingerprint);
-      if (status.state === 'complete') this.queries.setMetadata('semantic_repair_fingerprint', inputs.fingerprint);
+      const nativeIncomplete = (status.native?.failedTus ?? 0) > 0 || !macroScan.complete;
+      status.state = status.viewsFailed || missingScopedViews || nativeIncomplete ? 'partial' : 'complete';
+      // 首次采集可能新增 selective stub。指纹使用实际采集并保存的声明哈希，否则下一次
+      // 无变更 catch-up 会将新增依赖误当输入漂移，重新启动全部分析器。静态部分仍是
+      // 本轮开始读取的原 CDB/工具快照，不能重读新数据库后给旧事实盖成功印章。
+      const declarations = new Map<string, string>();
+      for (const node of this.queries.getNodesByKind('function').concat(this.queries.getNodesByKind('method'))) {
+        if (node.semanticOrigin !== 'libclang') continue;
+        let hash = 'unavailable';
+        try { hash = JSON.parse(this.queries.getMetadata(`cpp_native:${node.id}`) ?? '{}').declarationHash ?? hash; }
+        catch { /* 损坏证据不猜测哈希；后续真实输入核验仍会使其失效。 */ }
+        declarations.set(node.filePath, hash);
+      }
+      const fingerprint = inputs.baseFingerprint
+        ? fingerprintCppNativeDeclarations(inputs.baseFingerprint, [...declarations]) : inputs.fingerprint;
+      this.queries.setMetadata('semantic_repair_attempt_fingerprint', fingerprint);
+      if (status.state === 'complete') this.queries.setMetadata('semantic_repair_fingerprint', fingerprint);
       else status.reason = missingScopedViews ? 'targeted view coverage incomplete' :
-        `${status.viewsFailed} compilation views failed`;
+        [status.viewsFailed ? `${status.viewsFailed} clangd compilation views failed` : '',
+          (status.native?.failedTus ?? 0) ? `${status.native!.failedTus} native macro TU scopes incomplete` : '',
+          !macroScan.complete ? `macro structural scan incomplete: ${macroScan.reasons.join('; ')}` : ''].filter(Boolean).join('; ');
     } catch (error) {
       status.reason = String(error);
     }
@@ -712,7 +745,9 @@ export class CodeGraph {
           });
 
           const semanticInputsStarted = Date.now();
-          const semanticInputs = resolveCppSemanticInputs(this.projectRoot);
+          const semanticInputs = resolveCppSemanticInputs(this.projectRoot,
+            this.queries.getNodesByKind('function').concat(this.queries.getNodesByKind('method'))
+              .filter(node => node.semanticOrigin === 'libclang').map(node => node.filePath));
           if (process.env.CODEGRAPH_SYNTH_TIMINGS && semanticInputs) console.error(
             `[semantic-timing] resolve-inputs: ${Date.now() - semanticInputsStarted}ms`);
           const semanticEnabled = !!semanticInputs?.fingerprint;
@@ -927,7 +962,9 @@ export class CodeGraph {
           try { return this.queries.isNameSegmentVocabEmpty(); } catch { return false; }
         })();
 
-        const semanticInputs = resolveCppSemanticInputs(this.projectRoot);
+        const semanticInputs = resolveCppSemanticInputs(this.projectRoot,
+          this.queries.getNodesByKind('function').concat(this.queries.getNodesByKind('method'))
+            .filter(node => node.semanticOrigin === 'libclang').map(node => node.filePath));
         let semanticMembership: ReturnType<QueryBuilder['captureCppSemanticMembership']> | null = null;
         const result = await this.orchestrator.sync(options.onProgress, options.paths, files => {
           if (!semanticInputs) return;
@@ -1317,7 +1354,9 @@ export class CodeGraph {
    * @return 未启用时为 null；否则给出修复完成度、统计或输入错误原因
    */
   getCppSemanticRepairStatus(): CppSemanticRepairStatus | null {
-    const inputs = resolveCppSemanticInputs(this.projectRoot);
+    const inputs = resolveCppSemanticInputs(this.projectRoot,
+      this.queries.getNodesByKind('function').concat(this.queries.getNodesByKind('method'))
+        .filter(node => node.semanticOrigin === 'libclang').map(node => node.filePath));
     if (!inputs) return null;
     const raw = this.queries.getMetadata('semantic_repair_status');
     let stored: CppSemanticRepairStatus | null = null;

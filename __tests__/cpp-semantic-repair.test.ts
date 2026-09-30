@@ -138,6 +138,26 @@ describe('C/C++ semantic node reconciliation', () => {
     expect(queries.getNodesByFile('vendor/sdk.h').map(node => node.name)).toEqual(['SDK_USED']);
   });
 
+  it('invalidates a known macro range after its bytes move or disappear despite an unrelated unresolved include', async () => {
+    const header = path.join(directory, 'sample.h'); const unit = path.join(directory, 'main.c');
+    fs.writeFileSync(header, '#define BEFORE(x) sink(x)\n');
+    fs.writeFileSync(unit, '#include "sample.h"\n#include "unavailable.h"\nvoid run(void) { BEFORE(1); }\n');
+    queries.upsertFile({ path: 'sample.h', contentHash: 'fixture', language: 'c', size: 26,
+      modifiedAt: 1, indexedAt: 1, nodeCount: 0 });
+    const first = { nodes: [] as Node[], complete: true };
+    await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'], false, first);
+    expect(first.complete).toBe(false); const oldId = first.nodes[0]!.id;
+    fs.writeFileSync(header, '\n#define AFTER(x) sink(x)\n');
+    fs.writeFileSync(unit, '#include "sample.h"\n#include "unavailable.h"\nvoid run(void) { AFTER(1); }\n');
+    const second = { nodes: [] as Node[], complete: true };
+    await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'], false, second);
+    expect(second.complete).toBe(false); expect(queries.getNodeById(oldId)).toBeNull();
+    expect(queries.getNodesByFile('sample.h')).toMatchObject([{ name: 'AFTER', startLine: 2, endLine: 2 }]);
+    fs.writeFileSync(header, '\n');
+    await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c']);
+    expect(queries.getNodesByFile('sample.h')).toEqual([]);
+  });
+
   it('keeps conditional callback typedef alternatives canonical and binds only verified views', async () => {
     const source = '#ifndef EVENTS_H\n#define EVENTS_H\n#if defined(FEATURE_OLD)\ntypedef void (*EventCallback)(int);\n#else\n' +
       'typedef void (*EventCallback)(int, const char *);\n#endif\n#endif\n';
@@ -825,6 +845,45 @@ describe('C/C++ semantic node reconciliation', () => {
     expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 0, removed: 0 });
     expect(conn.getDb().prepare('SELECT config_id FROM semantic_edge_configs WHERE edge_id = ?')
       .all(original.id)).toEqual([{ config_id: 'one' }]);
+  });
+
+  it('retains native project-edge memberships on partial or advisory macro coverage and retires removed configs', () => {
+    const caller = baseline('caller.c', 'caller', 10, 30);
+    const target = baseline('variant.c', 'feature', 2, 8);
+    queries.insertNodes([caller, target]);
+    const input = collection(['one', 'two'], ['one', 'two'].flatMap(id => [
+      fact(id, 'caller.c', 'caller', 10, 30), fact(id, 'variant.c', 'feature', 2, 8),
+    ]));
+    for (const view of input.views) {
+      view.coveredFiles = ['caller.c', 'variant.c']; view.analyzedTuCount = 2;
+      view.native = { attemptedTus: 1, failedTus: 0, durationMs: 1, bytes: 1, visited: 1,
+        contexts: [], reasons: [], coveredFiles: ['caller.c'], failedFiles: [],
+        macroIds: ['macro-fixture'], structuralComplete: true };
+    }
+    input.calls = ['one', 'two'].map(configId => ({ configId,
+      caller: fact(configId, 'caller.c', 'caller', 10, 30),
+      callee: fact(configId, 'variant.c', 'feature', 2, 8), callLine: 14, callColumn: 4,
+      provenance: 'libclang', native: { usr: 'c:@F@feature', linkage: 4, translationUnit: 'caller.c',
+        contextHash: 'a'.repeat(64), declarationHash: 'b'.repeat(64), libraryVersion: 'clang version 19.1.7',
+        macroId: 'macro-fixture', spellingFile: '/fixture.h', spellingLine: 1, spellingColumn: 1 } }));
+    reconcileCppSemanticNodes(conn.getDb(), queries, input);
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 1, removed: 0 });
+    const edge = conn.getDb().prepare('SELECT id FROM edges WHERE source=?').get(caller.id) as { id: number };
+    input.calls = input.calls.filter(call => call.configId === 'one');
+    input.views[1]!.native!.coveredFiles = [];
+    input.views[1]!.native!.failedFiles = ['caller.c']; input.views[1]!.native!.failedTus = 1;
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 0, removed: 0 });
+    expect(conn.getDb().prepare('SELECT config_id FROM semantic_edge_configs WHERE edge_id=? ORDER BY config_id')
+      .all(edge.id!)).toEqual([{ config_id: 'one' }, { config_id: 'two' }]);
+    input.calls = [];
+    expect(queries.reconcileCppSemanticCalls({ ...input, inventory: 'advisory' }).removed).toBe(0);
+    expect(queries.getOutgoingEdges(caller.id)).toHaveLength(1);
+    input.views = input.views.slice(0, 1); input.symbols = input.symbols.filter(symbol => symbol.configId === 'one');
+    reconcileCppSemanticNodes(conn.getDb(), queries, input);
+    expect(conn.getDb().prepare('SELECT config_id FROM semantic_edge_configs WHERE edge_id=?').all(edge.id!))
+      .toEqual([{ config_id: 'one' }]);
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 0, removed: 1 });
+    expect(queries.getOutgoingEdges(caller.id)).toEqual([]);
   });
 
   it('corrects a wrong static target only with complete coverage and retains heuristic dispatch', () => {

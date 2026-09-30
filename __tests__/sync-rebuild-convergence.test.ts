@@ -525,7 +525,8 @@ describe('C/C++ semantic sync convergence', () => {
     if (fs.existsSync('/usr/bin/clangd-19')) {
       vi.mocked(collectCppSemanticFacts).mockClear();
       process.env.CODEGRAPH_CLANGD_PATH = '/usr/bin/clangd-19';
-      expect(graph.getCppSemanticRepairStatus()?.state).toBe('stale');
+      const status = graph.getCppSemanticRepairStatus();
+      expect(status?.state, JSON.stringify(status)).toBe('stale');
       await graph.sync();
       expect(vi.mocked(collectCppSemanticFacts)).toHaveBeenCalledOnce();
       expect(vi.mocked(collectCppSemanticFacts).mock.lastCall?.[3]?.scopeFiles).toBeUndefined();

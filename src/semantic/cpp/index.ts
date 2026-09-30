@@ -14,6 +14,8 @@ import { documentSymbolFacts, incomingCallFacts, SemanticCallFact, SemanticSymbo
   projectFileFromUri } from './facts';
 import { getParser } from '../../extraction/grammars';
 import type { Node as SyntaxNode } from 'web-tree-sitter';
+import type { Node } from '../../types';
+import { collectNativeMacroCalls, nativeDeclarationHash, NATIVE_HELPER_PATH } from './native-callees';
 
 export { buildCompileViews, materializeCompileView } from './compile-views';
 export { projectFileFromUri } from './facts';
@@ -36,6 +38,10 @@ export interface SemanticViewResult {
   failedTuCount: number;
   durationMs: number;
   error?: string;
+  /** 同会话 native 采集状态复用既有视图 metadata/status，不形成第二套生命周期。 */
+  native?: { attemptedTus: number; failedTus: number; durationMs: number; bytes: number; visited: number;
+    contexts: string[]; reasons: string[]; coveredFiles: string[]; failedFiles: string[];
+    macroIds: string[]; structuralComplete: boolean };
 }
 
 export interface SemanticFactCollection {
@@ -56,17 +62,32 @@ export interface CppSemanticInputs {
   runtime: CppSemanticRuntimeOptions;
   clangdVersion: string | null;
   fingerprint: string | null;
+  /** 同一次数据库/工具读取的静态指纹；新增 native 声明依赖不能重新读取 CDB 冒充同一快照。 */
+  baseFingerprint?: string;
   error?: string;
 }
 
-const REPAIR_ALGORITHM_VERSION = 3;
+const REPAIR_ALGORITHM_VERSION = 5;
+
+/**
+ * @brief 将同一静态输入快照与已观察的 selective 声明字节身份组成修复指纹。
+ * @param[in] baseFingerprint 本轮已核验数据库字节、配置和工具的静态指纹
+ * @param[in] declarations 实际选择的声明物理文件及字节哈希；不可读时保留 unavailable
+ * @return 确定性 SHA256；不读取源码、不执行工具，也不扩大声明依赖集合
+ */
+export function fingerprintCppNativeDeclarations(baseFingerprint: string,
+  declarations: ReadonlyArray<readonly [string, string]>): string {
+  return createHash('sha256').update(JSON.stringify([baseFingerprint,
+    [...declarations].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)])).digest('hex');
+}
 
 /**
  * @brief 在可信用户侧运行时解析语义输入并散列修复算法、工具、数据库原始字节与配置。
  * @param[in] projectRoot 项目根目录
+ * @param[in] nativeDeclarations 当前图中实际 selective stub 的物理声明路径，绝不遍历依赖全集
  * @return 当前修复输入及错误原因；工具或数据库不可用时不生成成功指纹
  */
-export function resolveCppSemanticInputs(projectRoot: string): CppSemanticInputs | null {
+export function resolveCppSemanticInputs(projectRoot: string, nativeDeclarations: string[] = []): CppSemanticInputs | null {
   const config = loadCppSemanticRepairConfig(projectRoot);
   if (!config) return null;
   const runtime = resolveCppSemanticRuntimeOptions({}, process.env, projectRoot);
@@ -87,10 +108,21 @@ export function resolveCppSemanticInputs(projectRoot: string): CppSemanticInputs
     const clangdVersion = versionLine.match(/\bclangd version\s+(\S+)/i)?.[1] ?? versionLine;
     const hash = createHash('sha256');
     hash.update(JSON.stringify([REPAIR_ALGORITHM_VERSION, clangdVersion, config,
-      runtime.clangdPath, runtime.queryDrivers, database.path]));
+      runtime.clangdPath, runtime.queryDrivers, database.path,
+      [runtime.nativePythonPath, runtime.nativeLibclangPath].map(file => {
+        if (!file) return null;
+        const stat = fs.statSync(file);
+        return [file, stat.size, stat.mtimeMs];
+      }), createHash('sha256').update(fs.readFileSync(NATIVE_HELPER_PATH)).digest('hex')]));
     // 与条目解析共享同一次原始字节读取，避免原子替换把旧条目标记成新 DB 的成功指纹。
     hash.update(database.contentHash);
-    return { database, runtime, clangdVersion, fingerprint: hash.digest('hex') };
+    const baseFingerprint = hash.digest('hex');
+    const declarations: Array<[string, string]> = [...new Set(nativeDeclarations)].map(file => {
+      try { return [file, nativeDeclarationHash(file)]; }
+      catch { return [file, 'unavailable']; }
+    });
+    return { database, runtime, clangdVersion, baseFingerprint,
+      fingerprint: fingerprintCppNativeDeclarations(baseFingerprint, declarations) };
   } catch (error) {
     return { database, runtime, clangdVersion: null, fingerprint: null,
       error: `clangd version or compilation database unavailable: ${String(error)}` };
@@ -105,10 +137,13 @@ export function resolveCppSemanticInputs(projectRoot: string): CppSemanticInputs
  * @param[in] signal 索引取消信号
  * @param[in] requestTimeoutMs 每请求超时毫秒数
  * @param[in] typedefCandidates 已有结构函数指针声明，只能通过真实 TU 引用确认绑定
+ * @param[in] macroCandidates 本轮实际结构宏，只触发真实调用候选 TU 的 native 采集
+ * @param[in] macroScanComplete 结构候选扫描是否在硬预算内完整
  * @return 此视图的正向事实、精确覆盖范围与失败诊断
  */
 async function collectView(root: string, view: CompileView, runtime: CppSemanticRuntimeOptions,
-  signal?: AbortSignal, requestTimeoutMs?: number, typedefCandidates: StructuralTypedefContext[] = []): Promise<{
+  signal?: AbortSignal, requestTimeoutMs?: number, typedefCandidates: StructuralTypedefContext[] = [],
+  macroCandidates: Node[] = [], macroScanComplete = true): Promise<{
     status: SemanticViewResult; symbols: SemanticSymbolFact[]; calls: SemanticCallFact[];
     typedefBindings: SemanticTypedefBinding[];
   }> {
@@ -119,6 +154,9 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
   const symbols: SemanticSymbolFact[] = [];
   const calls: SemanticCallFact[] = [];
   const typedefBindings: SemanticTypedefBinding[] = [];
+  const native = { attemptedTus: 0, failedTus: 0, durationMs: 0, bytes: 0, visited: 0,
+    contexts: [] as string[], reasons: [] as string[], coveredFiles: [] as string[], failedFiles: [] as string[],
+    macroIds: macroCandidates.map(candidate => candidate.id), structuralComplete: macroScanComplete };
   let typedefRequests = 0;
   let typedefRequestElapsedMs = 0;
   const sourceLines: SemanticSourceLines = new Map();
@@ -184,12 +222,16 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
       const discovered = discoveredByFile.get(file);
       if (!discovered) continue;
       try {
+        // 原生补证只覆盖既有宏工作清单；其失败不能抹去已完成的 clangd 定义/incoming 覆盖。
         let complete = indexReady;
         const candidateNames = new Set(typedefCandidates.map(candidate => candidate.name));
+        const macroNames = new Set(macroCandidates.map(candidate => candidate.name));
         const parser = getParser('c');
         const lines = sourceLines.get(file)!;
-        const tree = candidateNames.size && parser ? parser.parse(lines.join('\n')) : null;
+        const tree = (candidateNames.size || macroNames.size) && parser ? parser.parse(lines.join('\n')) : null;
         const positions: Array<{ name: string; line: number; character: number }> = [];
+        const macroInvocations: Array<{ line: number; column: number }> = [];
+        const invokedMacroNames = new Set<string>();
         /**
          * @brief 从真实 TU 中取结构类型引用候选，绑定必须另由 clangd definition 证实。
          * @param[in] syntax 当前 Tree-sitter 节点
@@ -200,6 +242,13 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
             positions.push({ name: syntax.text, line: syntax.startPosition.row,
               character: Buffer.from(lines[syntax.startPosition.row] ?? '', 'utf8')
                 .subarray(0, syntax.startPosition.column).toString('utf8').length });
+          }
+          if (syntax.type === 'call_expression') {
+            const callee = syntax.childForFieldName('function');
+            if (callee?.type === 'identifier' && macroNames.has(callee.text) && macroInvocations.length <= 512) {
+              macroInvocations.push({ line: callee.startPosition.row + 1, column: callee.startPosition.column + 1 });
+              invokedMacroNames.add(callee.text);
+            }
           }
           for (const child of syntax.namedChildren) collectTypes(child);
         };
@@ -252,6 +301,26 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
             error ??= String(failure);
           }
         }
+        if (macroInvocations.length) {
+          native.attemptedTus++;
+          const absolute = fs.realpathSync(path.join(root, file));
+          const result = await collectNativeMacroCalls(root, view.id, absolute,
+            createHash('sha256').update(lines.join('\n')).digest('hex'), client.effectiveCompileContext(absolute),
+            runtime, macroCandidates.filter(candidate => invokedMacroNames.has(candidate.name)), macroInvocations,
+            symbols.filter(fact => !fact.external), signal);
+          native.durationMs += result.durationMs; native.bytes += result.bytes; native.visited += result.visited;
+          if (result.contextHash) native.contexts.push(result.contextHash);
+          symbols.push(...result.symbols); calls.push(...result.calls);
+          if (!result.complete) {
+            native.failedTus++; native.failedFiles.push(file);
+            native.reasons.push(`${file}: ${result.reason ?? 'native collection incomplete'}`);
+          } else native.coveredFiles.push(file);
+        } else if (tree || !macroCandidates.length) {
+          native.coveredFiles.push(file);
+        } else {
+          native.failedFiles.push(file); native.failedTus++;
+          native.reasons.push(`${file}: macro invocation syntax unavailable`);
+        }
         if (!client.hasCleanDiagnostics(uri)) {
           complete = false;
           error ??= `clangd diagnostics missing or erroneous: ${file}`;
@@ -292,7 +361,8 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
     inventory: view.inventory, grouping: view.grouping,
     success: failed.size === 0 && !error && !signal?.aborted,
     coveredFiles: covered, failedFiles: [...failed].sort(), analyzedTuCount: covered.length,
-    failedTuCount: failed.size, durationMs: Date.now() - started, ...(error ? { error } : {}) }, symbols, calls,
+    failedTuCount: failed.size, durationMs: Date.now() - started, ...(error ? { error } : {}),
+    ...(macroCandidates.length || !macroScanComplete ? { native } : {}) }, symbols, calls,
     typedefBindings };
 }
 
@@ -306,7 +376,8 @@ async function collectView(root: string, view: CompileView, runtime: CppSemantic
  */
 export async function collectCppSemanticFacts(projectRoot: string, database: CompilationDatabase,
   runtime: CppSemanticRuntimeOptions, options: { signal?: AbortSignal; requestTimeoutMs?: number;
-    scopeFiles?: string[]; typedefCandidates?: StructuralTypedefContext[] } = {}):
+    scopeFiles?: string[]; typedefCandidates?: StructuralTypedefContext[]; macroCandidates?: Node[];
+    macroScanComplete?: boolean } = {}):
   Promise<SemanticFactCollection> {
   const root = fs.realpathSync(projectRoot);
   const symbols: SemanticSymbolFact[] = [];
@@ -324,7 +395,8 @@ export async function collectCppSemanticFacts(projectRoot: string, database: Com
   }
   for (const view of compileViews) {
     if (selected && !view.entries.some(entry => selected.has(entry.file))) continue;
-    const result = await collectView(root, view, runtime, options.signal, options.requestTimeoutMs, options.typedefCandidates);
+    const result = await collectView(root, view, runtime, options.signal, options.requestTimeoutMs,
+      options.typedefCandidates, options.macroCandidates, options.macroScanComplete);
     views.push(result.status);
     symbols.push(...result.symbols);
     calls.push(...result.calls);

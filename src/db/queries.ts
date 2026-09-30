@@ -25,7 +25,7 @@ import { splitIdentifierSegments } from '../search/identifier-segments';
 import { semanticRangesOverlap, assertPairwiseSemanticOverlap,
   areDisjointCppIdCollisions } from '../semantic/cpp/facts';
 import { generateNodeId, semanticCollisionNodeId } from '../extraction/tree-sitter-helpers';
-import type { SemanticFactCollection, SemanticSymbolIdentity } from '../semantic/cpp';
+import type { SemanticFactCollection, SemanticSymbolIdentity, SemanticCallFact } from '../semantic/cpp';
 
 /**
  * Files that should not be candidates for "dominant file" detection: test/spec
@@ -542,7 +542,7 @@ export class QueryBuilder {
      * @return 文件、类型和行列均有效时为 true
      */
     const validIdentity = (identity: SemanticSymbolIdentity): boolean =>
-      !!identity && !!identity.filePath && !/^(?:\/|[A-Za-z]:[\\/])/.test(identity.filePath) &&
+      !!identity && !!identity.filePath && (identity.external || !/^(?:\/|[A-Za-z]:[\\/])/.test(identity.filePath)) &&
       !identity.filePath.split(/[\\/]/).includes('..') && !!identity.name &&
       (identity.kind === 'function' || identity.kind === 'method') &&
       Number.isSafeInteger(identity.startLine) && identity.startLine > 0 &&
@@ -551,7 +551,9 @@ export class QueryBuilder {
       Number.isSafeInteger(identity.endColumn) && identity.endColumn >= 0 &&
       (identity.endLine !== identity.startLine || identity.endColumn >= identity.startColumn);
     for (const call of collection.calls) {
-      if (!viewIds.has(call.configId) || !validIdentity(call.caller) || !validIdentity(call.callee) ||
+      if (!viewIds.has(call.configId) || call.caller.external ||
+          (call.callee.external && (call.provenance !== 'libclang' || !call.native?.usr || call.native.linkage !== 4)) ||
+          !validIdentity(call.caller) || !validIdentity(call.callee) ||
           !Number.isSafeInteger(call.callLine) || call.callLine < call.caller.startLine ||
           call.callLine > call.caller.endLine || !Number.isSafeInteger(call.callColumn) || call.callColumn < 0) {
         throw new Error('Invalid C/C++ semantic call fact');
@@ -595,20 +597,31 @@ export class QueryBuilder {
         targetNodes.set(node.id, node);
       }
     }
-    const observed = new Map<string, { source: Node; target: Node; line: number; col: number; configs: Set<string> }>();
+    const observed = new Map<string, { source: Node; target: Node; line: number; col: number; configs: Set<string>;
+      provenance: 'clangd' | 'libclang'; native?: SemanticCallFact['native']; expansions: NonNullable<SemanticCallFact['native']>[] }>();
+    const observedMacros: Array<{ node: Node; configId: string }> = [];
     const eligibleNames = new Map<string, Set<string>>();
     const eligibleTargets = new Map<string, Set<Node>>();
     for (const call of collection.calls) {
       const source = match(call.caller);
       const target = match(call.callee);
       if (!source || !target || !represented.has(`${call.configId}\0${target.id}`)) continue;
+      const macro = call.native?.macroId ? this.getNodeById(call.native.macroId) : null;
+      if (macro?.kind === 'constant' && macro.semanticOrigin === 'source-structure' &&
+          call.native?.spellingLine !== undefined && call.native.spellingLine >= macro.startLine &&
+          call.native.spellingLine <= macro.endLine) observedMacros.push({ node: macro, configId: call.configId });
       const key = JSON.stringify([source.id, target.id, call.callLine, call.callColumn]);
       let entry = observed.get(key);
       if (!entry) {
-        entry = { source, target, line: call.callLine, col: call.callColumn, configs: new Set() };
+        entry = { source, target, line: call.callLine, col: call.callColumn, configs: new Set(),
+          provenance: call.provenance ?? 'clangd', native: call.native, expansions: [] };
         observed.set(key, entry);
       }
       entry.configs.add(call.configId);
+      entry.native ??= call.native;
+      if (call.native && !entry.expansions.some(evidence => evidence.spellingFile === call.native!.spellingFile &&
+          evidence.spellingLine === call.native!.spellingLine && evidence.spellingColumn === call.native!.spellingColumn &&
+          evidence.contextHash === call.native!.contextHash)) entry.expansions.push(call.native);
       if (represented.has(`${call.configId}\0${source.id}`)) {
         let names = eligibleNames.get(source.id);
         if (!names) { names = new Set(); eligibleNames.set(source.id, names); }
@@ -635,38 +648,69 @@ export class QueryBuilder {
         view.coveredFiles.length === view.analyzedTuCount);
     };
     /**
+     * @brief 只接受同一 caller TU 的完整原生宏工作清单作为 native 负面证据。
+     * @param[in] file caller 的项目相对文件路径
+     * @return clangd 及所有相关 native scope 均完整时为 true；局部失败只允许正向追加
+     */
+    const nativeCovered = (file: string): boolean => covered(file) &&
+      collection.views.filter(view => view.coveredFiles.includes(file)).every(view =>
+        !!view.native && view.native.coveredFiles.includes(file) && !view.native.failedFiles.includes(file));
+    /**
      * @brief 限定调用者和被调者在同一权威、完整的配置里均有源码身份。
      * @param[in] source 调用者的图节点
      * @param[in] target 被调者的图节点
+     * @param[in] native 是否涉及 native 创建的边；项目内 callee 同样需要 native 完整覆盖
      * @return 两端均完整覆盖并共享已采集配置时为 true
      */
-    const fullyObservedRelation = (source: Node, target: Node): boolean =>
-      covered(source.filePath) && covered(target.filePath) && collection.views.some(view =>
-        view.coveredFiles.includes(source.filePath) && view.coveredFiles.includes(target.filePath) &&
+    const fullyObservedRelation = (source: Node, target: Node, native = false): boolean =>
+      covered(source.filePath) && (!native || nativeCovered(source.filePath)) &&
+      (target.semanticOrigin === 'libclang' ? nativeCovered(source.filePath) : covered(target.filePath)) && collection.views.some(view =>
+        view.coveredFiles.includes(source.filePath) && (target.semanticOrigin === 'libclang' || view.coveredFiles.includes(target.filePath)) &&
         represented.has(`${view.id}\0${source.id}`) && represented.has(`${view.id}\0${target.id}`));
     const result = { added: 0, removed: 0 };
     let repositioned = 0;
     const observedRelations = new Set([...observed.values()].map(entry => `${entry.source.id}\0${entry.target.id}`));
     this.db.transaction(() => {
       const select = this.db.prepare('SELECT id,provenance FROM edges WHERE source = ? AND target = ? AND kind = ? AND line = ? AND col = ?');
-      const insert = this.db.prepare("INSERT OR IGNORE INTO edges (source,target,kind,line,col,provenance) VALUES (?,?,'calls',?,?,'clangd')");
+      const insert = this.db.prepare("INSERT OR IGNORE INTO edges (source,target,kind,line,col,provenance,metadata) VALUES (?,?,'calls',?,?,?,?)");
       const member = this.db.prepare('INSERT OR IGNORE INTO semantic_edge_configs (edge_id,config_id) VALUES (?,?)');
       const retireMember = this.db.prepare('DELETE FROM semantic_edge_configs WHERE edge_id = ? AND config_id = ?');
+      // 结构声明自身不声称生效；只有真实展开的正向物理绑定才添加既有配置归属。
+      for (const { node, configId } of observedMacros) this.db.prepare(`INSERT OR IGNORE INTO semantic_node_configs
+        (node_id,config_id,signature,definition_line,definition_col) VALUES (?,?,?,?,?)`)
+        .run(node.id, configId, node.signature ?? null, node.startLine, node.startColumn);
+      // Native exporter 覆盖的是 caller TU 的展开调用；旧 external target 不需要自身成为项目 TU。
+      // 仅完整权威 caller 允许撤销本轮视图 membership，partial/advisory 保持旧正向证据。
+      for (const view of collection.views) {
+        if (!view.success || view.inventory !== 'authoritative' || collection.inventory !== 'authoritative') continue;
+        for (const file of view.coveredFiles) {
+          if (!nativeCovered(file) || (collection.scopeFiles && !collection.scopeFiles.includes(file))) continue;
+          this.db.prepare(`DELETE FROM semantic_edge_configs WHERE config_id = ? AND edge_id IN (
+            SELECT e.id FROM edges e JOIN nodes s ON s.id=e.source
+            WHERE e.provenance='libclang' AND s.file_path=? AND
+              (json_extract(e.metadata,'$.native.macroId') IN (SELECT value FROM json_each(?)) OR ?))`)
+            .run(view.id, file, JSON.stringify(view.native?.macroIds ?? []), view.native?.structuralComplete ? 1 : 0);
+        }
+      }
       // 精确坐标是边身份：同一调用者/目标的不同调用点必须逐条保留。
       for (const entry of observed.values()) {
         let row = select.get(entry.source.id, entry.target.id, 'calls', entry.line, entry.col) as
           { id: number; provenance: string | null } | undefined;
         if (!row) {
-          result.added += insert.run(entry.source.id, entry.target.id, entry.line, entry.col).changes;
+          result.added += insert.run(entry.source.id, entry.target.id, entry.line, entry.col, entry.provenance,
+            entry.native ? JSON.stringify({ native: entry.native, nativeExpansions: entry.expansions }) : null).changes;
           row = select.get(entry.source.id, entry.target.id, 'calls', entry.line, entry.col) as typeof row;
         }
         // 唯一索引可能已被 heuristic 占用；绝不改写其归属或删除它。
         if (row && row.provenance !== 'heuristic') {
-          if (fullyObservedRelation(entry.source, entry.target)) {
+          if (row.provenance === 'libclang' && entry.native && fullyObservedRelation(entry.source, entry.target, true))
+            this.db.prepare('UPDATE edges SET metadata=? WHERE id=?')
+              .run(JSON.stringify({ native: entry.native, nativeExpansions: entry.expansions }), row.id);
+          if (fullyObservedRelation(entry.source, entry.target, row.provenance === 'libclang')) {
             // 完整覆盖方可撤销已验证边在旧视图里的归属；部分结果只附加正向事实。
             for (const view of collection.views) {
               if (view.coveredFiles.includes(entry.source.filePath) &&
-                  view.coveredFiles.includes(entry.target.filePath) &&
+                  (entry.target.semanticOrigin === 'libclang' || view.coveredFiles.includes(entry.target.filePath)) &&
                   represented.has(`${view.id}\0${entry.source.id}`) &&
                   represented.has(`${view.id}\0${entry.target.id}`)) retireMember.run(row.id, view.id);
             }
@@ -691,6 +735,8 @@ export class QueryBuilder {
         const source = this.getNodeById(sourceId);
         if (!source || !covered(source.filePath)) continue;
         for (const edge of stale.all(sourceId) as Array<{ id: number; target: string; line: number | null; col: number | null; name: string }>) {
+          // Native 边只由其完整工作清单/输入失效路径退役，不用 ordinary clangd 的缺失事实删除。
+          if ((this.db.prepare('SELECT provenance FROM edges WHERE id=?').get(edge.id) as { provenance?: string })?.provenance === 'libclang') continue;
           if (collection.scopeFiles && !collection.scopeFiles.includes(source.filePath) &&
               !collection.scopeFiles.includes(this.getNodeById(edge.target)?.filePath ?? '')) continue;
           // 缺失事实只能否定已纳入语义清单的目标；错误 static 目标需有同名正向证据。
@@ -712,6 +758,23 @@ export class QueryBuilder {
             const deleted = remove.run(edge.id).changes;
             result.removed += deleted;
             if (observedRelations.has(`${sourceId}\0${edge.target}`)) repositioned += deleted;
+          }
+        }
+      }
+      if (collection.inventory === 'authoritative' && collection.views.length > 0 &&
+          collection.views.every(view => view.success && view.inventory === 'authoritative')) {
+        for (const row of this.db.prepare(`SELECT e.id,s.file_path file FROM edges e JOIN nodes s ON s.id=e.source
+          WHERE e.provenance='libclang' AND NOT EXISTS
+          (SELECT 1 FROM semantic_edge_configs WHERE edge_id=e.id)`).all() as Array<{ id: number; file: string }>) {
+          if (nativeCovered(row.file)) result.removed += this.db.prepare('DELETE FROM edges WHERE id=?').run(row.id).changes;
+        }
+        // Stub 归属来自仍存活的真实调用，而不是全局 external TU 覆盖；只整理实际 native 节点。
+        for (const node of this.getNodesByKind('function').concat(this.getNodesByKind('method'))) {
+          if (node.semanticOrigin !== 'libclang') continue;
+          this.db.prepare(`DELETE FROM semantic_node_configs WHERE node_id=? AND config_id NOT IN (
+            SELECT m.config_id FROM semantic_edge_configs m JOIN edges e ON e.id=m.edge_id WHERE e.target=?)`).run(node.id, node.id);
+          if (!(this.db.prepare('SELECT 1 FROM edges WHERE source=? OR target=? LIMIT 1').get(node.id, node.id))) {
+            this.deleteNode(node.id); this.db.prepare('DELETE FROM project_metadata WHERE key=?').run(`cpp_native:${node.id}`);
           }
         }
       }
@@ -1818,10 +1881,12 @@ export class QueryBuilder {
     // Lowering the parameter in SQL rather than in JS is deliberate: SQLite's
     // `lower()` and NOCASE both fold ASCII only, while JS `.toLowerCase()`
     // folds Unicode, which would silently stop matching non-ASCII names.
+    // 同一个词在符号检索与自然语言逐词候选阶段的含义不同；后者不能统一加符号分段奖励。
+    const component = options.intent !== 'prose' && /^[a-z][a-z0-9]{1,31}$/i.test(text)
+      ? text.toLowerCase() : '';
     if (query) {
       const existingIds = new Set(results.map(r => r.node.id));
       const maxFtsScore = results.length > 0 ? Math.max(...results.map(r => r.score)) : 1;
-      const component = /^[a-z][a-z0-9]{1,31}$/i.test(text) ? text.toLowerCase() : '';
       const terms = query.split(/\s+/).filter(t => t.length >= 2);
       for (const term of terms) {
         let sql = 'SELECT * FROM nodes WHERE lower(name) = lower(?)';
@@ -1871,7 +1936,6 @@ export class QueryBuilder {
     // Apply multi-signal scoring
     if (results.length > 0 && (text || query)) {
       const scoringQuery = text || query;
-      const component = /^[a-z][a-z0-9]{1,31}$/i.test(text) ? text.toLowerCase() : '';
       results = results.map(r => {
         // A path the project de-prioritized is saying its symbol NAMES are not
         // the answer, so the exact-name bonus has to be damped too. The -15 path
@@ -1885,6 +1949,8 @@ export class QueryBuilder {
         return {
           ...r,
           score: r.score
+            // Selective external 声明可检索，但同名项目符号优先；不把 SDK stub 当项目实现。
+            - (r.node.semanticOrigin === 'libclang' ? 35 : 0)
             + kindBonus(r.node.kind)
             + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens, deprioritized)
             + (deprioritized ? Math.round(nameBonus * DEPRIORITIZED_NAME_BONUS_SCALE) : nameBonus)
@@ -1892,11 +1958,11 @@ export class QueryBuilder {
               splitIdentifierSegments(r.node.name).includes(component) ? 25 : 0),
         };
       });
-      results.sort((a, b) => b.score - a.score ||
+      results.sort((a, b) => b.score - a.score || (options.intent !== 'prose' ?
         a.node.filePath.localeCompare(b.node.filePath) ||
         a.node.startLine - b.node.startLine ||
         a.node.startColumn - b.node.startColumn ||
-        a.node.id.localeCompare(b.node.id));
+        a.node.id.localeCompare(b.node.id) : 0));
       // Trim to requested limit after rescoring
       if (results.length > limit) {
         results = results.slice(0, limit);

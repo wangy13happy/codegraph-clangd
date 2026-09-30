@@ -1,6 +1,7 @@
 /** @file C/C++ 语义节点归并、配置 provenance 和保守退役。 */
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { SqliteDatabase } from '../../db/sqlite-adapter';
 import { QueryBuilder } from '../../db/queries';
@@ -11,6 +12,67 @@ import { isWithinProject } from './compile-database';
 import { SemanticFactCollection } from './index';
 import { SemanticSymbolFact, semanticRangesOverlap, assertPairwiseSemanticOverlap,
   StructuralTypedefContext } from './facts';
+import { nativeDeclarationHash } from './native-callees';
+
+/**
+ * @brief 显式同步时以已证明变化或删除的物理声明失效自有 native 关系。
+ * @param[in] db 既有图数据库连接
+ * @param[in] queries 节点与元数据接口
+ * @param[in] root 项目真实根目录，用于核验 native 自有主文件输入
+ * @return 无；不可读属于 unknown 并保留历史证据，不作为 absence 删除条件
+ */
+export function invalidateCppNativeDeclarations(db: SqliteDatabase, queries: QueryBuilder, root: string): void {
+  db.transaction(() => {
+    const invalidatedTargets = new Set<string>();
+    for (const edge of db.prepare("SELECT id,target,metadata FROM edges WHERE provenance='libclang'")
+      .all() as Array<{ id: number; target: string; metadata: string | null }>) {
+      let evidence: { translationUnit?: string; sourceHash?: string; spellingFile?: string; macroHash?: string;
+        declarationFile?: string; declarationHash?: string };
+      try { evidence = JSON.parse(edge.metadata ?? '{}').native ?? {}; } catch { continue; }
+      const inputs: Array<[string, string | undefined]> = [];
+      if (evidence.translationUnit && !path.isAbsolute(evidence.translationUnit) &&
+          !evidence.translationUnit.split(/[\\/]/).includes('..'))
+        inputs.push([path.join(root, evidence.translationUnit), evidence.sourceHash]);
+      if (evidence.spellingFile && path.isAbsolute(evidence.spellingFile))
+        inputs.push([evidence.spellingFile, evidence.macroHash]);
+      if (evidence.declarationFile && path.isAbsolute(evidence.declarationFile))
+        inputs.push([evidence.declarationFile, evidence.declarationHash]);
+      // 输入字节变化/物理文件删除是正面失效事实，和失败分析所产生的缺失事实不同。
+      // 仅清 native 自有边；普通 baseline/heuristic 关系和 unknown 的权限错误仍保留。
+      const invalid = inputs.some(([file, hash]) => {
+        if (!hash) return false;
+        try { return nativeDeclarationHash(file) !== hash; }
+        catch (failure) { return ['ENOENT', 'ENOTDIR'].includes((failure as NodeJS.ErrnoException).code ?? ''); }
+      });
+      if (invalid) { db.prepare('DELETE FROM edges WHERE id=?').run(edge.id); invalidatedTargets.add(edge.target); }
+    }
+    for (const node of queries.getNodesByKind('function').concat(queries.getNodesByKind('method'))) {
+      if (node.semanticOrigin !== 'libclang') continue;
+      let evidence: { declarationHash?: string };
+      try { evidence = JSON.parse(queries.getMetadata(`cpp_native:${node.id}`) ?? '{}'); }
+      catch { continue; }
+      let invalid = false;
+      try { invalid = nativeDeclarationHash(node.filePath) !== evidence.declarationHash; }
+      catch (failure) {
+        const code = (failure as NodeJS.ErrnoException).code;
+        invalid = code === 'ENOENT' || code === 'ENOTDIR';
+      }
+      if (!invalid) {
+        // 输入失效已明确删除最后一条自有引用时，可以清理孤立 stub；不借其他 view 的 absence。
+        if (invalidatedTargets.has(node.id) &&
+            !db.prepare('SELECT 1 FROM edges WHERE source=? OR target=? LIMIT 1').get(node.id, node.id)) {
+          queries.deleteNode(node.id); db.prepare('DELETE FROM project_metadata WHERE key=?').run(`cpp_native:${node.id}`);
+        }
+        continue;
+      }
+      // 声明自身已改变是正面失效事实；只失效本出口的数据，不触碰普通或 heuristic 边。
+      db.prepare("DELETE FROM edges WHERE provenance='libclang' AND target=?").run(node.id);
+      db.prepare('DELETE FROM semantic_node_configs WHERE node_id=?').run(node.id);
+      db.prepare('DELETE FROM project_metadata WHERE key=?').run(`cpp_native:${node.id}`);
+      if (!db.prepare('SELECT 1 FROM edges WHERE source=? OR target=? LIMIT 1').get(node.id, node.id)) queries.deleteNode(node.id);
+    }
+  })();
+}
 
 /**
  * @brief 从既有函数指针 typedef 节点恢复规范名称、条件源码范围，不推断生效分支。
@@ -145,27 +207,42 @@ export function reconcileCppTypedefBindings(db: SqliteDatabase, queries: QueryBu
  * @param[in] queries 当前图节点读写接口
  * @param[in] translationUnits 编译数据库中的项目相对 TU 路径；不会扫描依赖 TU 或递归 include
  * @param[in] allowRetirement 权威采集完整时允许退役不再有结构候选的旧宏
+ * @param[out] candidateResult 可选输出，本轮实际候选及结构扫描是否在预算内完整
+ * @param[in] includeDirectories 共享 CDB 解析的项目内 include 目录，仅分类失败，不猜测生效顺序
  * @return 本轮新建的宏定义节点数量；缺失语法或文件时跳过相应文件
  */
 export async function reconcileCppStructuralMacros(root: string, db: SqliteDatabase,
-  queries: QueryBuilder, translationUnits: string[], allowRetirement = false): Promise<number> {
+  queries: QueryBuilder, translationUnits: string[], allowRetirement = false,
+  candidateResult?: { nodes: Node[]; complete: boolean; scannedNodes?: number; sourceBytes?: number; reasons?: string[] },
+  includeDirectories: string[] = []): Promise<number> {
   // 普通提取运行在解析 worker；主线程需为此 opt-in 阶段单独加载 C 语法。
   await loadGrammarsForLanguages(['c']);
   const parser = getParser('c');
-  if (!parser) return 0;
+  if (!parser) {
+    if (candidateResult) { candidateResult.complete = false; candidateResult.reasons = ['C grammar unavailable']; }
+    return 0;
+  }
   let added = 0;
   let complete = true;
+  let sourceBytes = 0;
+  let scannedNodes = 0;
+  let candidateCount = 0;
+  const reasons = new Set<string>();
   const referenced = new Map<string, Set<string>>();
   const tracked = new Map(queries.getAllFiles().map(file => [file.path, file]));
   for (const unit of new Set(translationUnits)) {
     let source: string;
     try {
       const absolute = fs.realpathSync(path.join(root, unit));
-      if (!isWithinProject(root, absolute) || !fs.statSync(absolute).isFile()) { complete = false; continue; }
+      if (!isWithinProject(root, absolute) || !fs.statSync(absolute).isFile()) {
+        complete = false; if (reasons.size < 16) reasons.add(`${unit}: TU outside project or not a regular file`); continue;
+      }
       source = fs.readFileSync(absolute, 'utf8');
-    } catch { complete = false; continue; }
+    } catch { complete = false; if (reasons.size < 16) reasons.add(`${unit}: TU unavailable`); continue; }
+    sourceBytes += Buffer.byteLength(source);
+    if (sourceBytes > 8 * 1024 * 1024) { complete = false; reasons.add('source byte budget exceeded'); break; }
     const tree = parser.parse(source);
-    if (!tree) { complete = false; continue; }
+    if (!tree) { complete = false; if (reasons.size < 16) reasons.add(`${unit}: syntax unavailable`); continue; }
     const names = new Set<string>();
     const headers = new Set<string>();
     /**
@@ -174,6 +251,7 @@ export async function reconcileCppStructuralMacros(root: string, db: SqliteDatab
      * @return 无；名字仅筛选结构候选，不证明宏绑定或预处理分支生效
      */
     const collect = (syntax: SyntaxNode): void => {
+      if (++scannedNodes > 1000000) { complete = false; reasons.add('syntax node budget exceeded'); return; }
       if (syntax.type === 'identifier') names.add(syntax.text);
       if (syntax.type === 'preproc_include') {
         const included = syntax.childForFieldName('path');
@@ -183,7 +261,24 @@ export async function reconcileCppStructuralMacros(root: string, db: SqliteDatab
             const absolute = fs.realpathSync(path.resolve(root, path.dirname(unit), included.text.slice(1, -1)));
             const relative = path.relative(root, absolute).replace(/\\/g, '/');
             if (isWithinProject(root, absolute) && tracked.has(relative)) headers.add(relative);
-          } catch { complete = false; }
+          } catch {
+            // 相对包含位置失败不代表编译器不能经 -I 找到它；保留已观察结构，禁止以缺失退役。
+            complete = false;
+            if (reasons.size < 16) {
+              const name = included.text.slice(1, -1);
+              const candidates: string[] = [];
+              for (const directory of includeDirectories.slice(0, 256)) {
+                try {
+                  const real = fs.realpathSync(path.resolve(root, directory, name));
+                  const relative = path.relative(root, real).replace(/\\/g, '/');
+                  if (isWithinProject(root, real) && fs.statSync(real).isFile())
+                    candidates.push(`${tracked.has(relative) ? 'indexed' : 'unindexed'} project candidate ${relative}`);
+                } catch { /* 仅分类已存在文件；未找到不意味着外部编译上下文没有此头。 */ }
+              }
+              reasons.add(`${unit}: direct quoted include unresolved: ${name}; ${candidates.length ?
+                [...new Set(candidates)].join(', ') : 'not found in project CDB include paths; external/unknown'}`);
+            }
+          }
         }
       }
       for (const child of syntax.namedChildren) collect(child);
@@ -191,6 +286,7 @@ export async function reconcileCppStructuralMacros(root: string, db: SqliteDatab
     collect(tree.rootNode);
     tree.delete();
     for (const header of headers) {
+      if (referenced.size >= 256 && !referenced.has(header)) { complete = false; reasons.add('direct header budget exceeded'); break; }
       const used = referenced.get(header) ?? new Set<string>();
       for (const name of names) used.add(name);
       referenced.set(header, used);
@@ -203,22 +299,40 @@ export async function reconcileCppStructuralMacros(root: string, db: SqliteDatab
     let source: string;
     try {
       const absolute = fs.realpathSync(path.join(root, file.path));
-      if (!isWithinProject(root, absolute) || !fs.statSync(absolute).isFile()) { complete = false; continue; }
+      if (!isWithinProject(root, absolute) || !fs.statSync(absolute).isFile()) {
+        complete = false; if (reasons.size < 16) reasons.add(`${file.path}: header outside project or not a regular file`); continue;
+      }
       source = fs.readFileSync(absolute, 'utf8');
-    } catch { complete = false; continue; }
+    } catch { complete = false; if (reasons.size < 16) reasons.add(`${file.path}: header unavailable`); continue; }
+    sourceBytes += Buffer.byteLength(source);
+    if (sourceBytes > 8 * 1024 * 1024) { complete = false; reasons.add('source byte budget exceeded'); break; }
     const lines = source.split('\n');
     const existing = new Map(queries.getNodesByFile(file.path).map(node => [node.id, node]));
+    for (const node of existing.values()) {
+      if (node.semanticOrigin !== 'source-structure' || node.kind !== 'constant') continue;
+      let oldHash: string | undefined;
+      try { oldHash = JSON.parse(queries.getMetadata(`cpp_macro:${node.id}`) ?? '{}').definitionHash; } catch { continue; }
+      const currentHash = createHash('sha256').update(lines.slice(node.startLine - 1, node.endLine).join('\n')).digest('hex');
+      if (!oldHash || oldHash === currentHash) continue;
+      // 此物理范围的已保存定义字节确实改变，独立于其他 TU/include 的 partial。
+      // 不利用“没采到”删除，且只退役结构宏自身及其 native 自有展开边。
+      db.prepare("DELETE FROM edges WHERE provenance='libclang' AND json_extract(metadata,'$.native.macroId')=?").run(node.id);
+      queries.deleteNode(node.id); db.prepare('DELETE FROM project_metadata WHERE key=?').run(`cpp_macro:${node.id}`);
+      existing.delete(node.id);
+    }
     const tree = parser.parse(source);
-    if (!tree) { complete = false; continue; }
+    if (!tree) { complete = false; if (reasons.size < 16) reasons.add(`${file.path}: syntax unavailable`); continue; }
     /**
      * @brief 遍历 C 结构预处理定义并保留宏真实源码跨度。
      * @param[in] syntax 当前 Tree-sitter 节点
      * @return 无；仅将完整名称与位置构成的节点加入待写入集合
      */
     const visit = (syntax: SyntaxNode): void => {
+      if (++scannedNodes > 1000000) { complete = false; reasons.add('syntax node budget exceeded'); return; }
       if (syntax.type === 'preproc_def' || syntax.type === 'preproc_function_def') {
         const identifier = syntax.namedChild(0);
         if (identifier?.type === 'identifier' && usedNames.has(identifier.text)) {
+          if (++candidateCount > 512) { complete = false; reasons.add('macro candidate budget exceeded'); return; }
           const name = identifier.text;
           const startLine = syntax.startPosition.row + 1;
           const id = generateNodeId(file.path, 'constant', name, startLine);
@@ -236,6 +350,10 @@ export async function reconcileCppStructuralMacros(root: string, db: SqliteDatab
             else { queries.insertNode(node); added++; }
             existing.set(id, node);
           }
+          if (candidateResult && existing.get(id)) candidateResult.nodes.push(existing.get(id)!);
+          if (existing.get(id)?.semanticOrigin === 'source-structure') queries.setMetadata(`cpp_macro:${id}`,
+            JSON.stringify({ definitionHash: createHash('sha256').update(lines.slice(startLine - 1,
+              existing.get(id)!.endLine).join('\n')).digest('hex') }));
         }
       }
       for (const child of syntax.namedChildren) visit(child);
@@ -250,6 +368,14 @@ export async function reconcileCppStructuralMacros(root: string, db: SqliteDatab
       if (!retained.has(row.id)) queries.deleteNode(row.id);
     }
   }
+  db.prepare(`DELETE FROM project_metadata WHERE substr(key,1,10)='cpp_macro:' AND
+    NOT EXISTS (SELECT 1 FROM nodes WHERE id=substr(project_metadata.key,11))`).run();
+  if (candidateResult) {
+    candidateResult.complete = complete;
+    candidateResult.scannedNodes = scannedNodes;
+    candidateResult.reasons = [...reasons].slice(0, 16);
+    candidateResult.sourceBytes = sourceBytes;
+  }
   return added;
 }
 
@@ -260,7 +386,10 @@ export async function reconcileCppStructuralMacros(root: string, db: SqliteDatab
  * @return 无；坐标、配置或项目相对路径非法时抛错并回滚事务
  */
 function validateFact(fact: SemanticSymbolFact, viewIds: ReadonlySet<string>): void {
-  if (!viewIds.has(fact.configId) || !fact.filePath || path.isAbsolute(fact.filePath) ||
+  const external = fact.external === true && fact.native?.linkage === 4 && !!fact.native.usr &&
+    /^[a-f0-9]{64}$/.test(fact.native.contextHash) && /^[a-f0-9]{64}$/.test(fact.native.declarationHash) &&
+    path.isAbsolute(fact.filePath) && fs.statSync(fact.filePath).isFile();
+  if (fact.external && !external || !viewIds.has(fact.configId) || !fact.filePath || (!external && path.isAbsolute(fact.filePath)) ||
       fact.filePath.split(/[\\/]/).includes('..') || !fact.name ||
       (fact.kind !== 'function' && fact.kind !== 'method') ||
       !Number.isSafeInteger(fact.startLine) || fact.startLine < 1 ||
@@ -344,7 +473,14 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
       // 当前权威完整快照确认配置全集，故以前仅靠 advisory 建立的过期配置也可退役；
       // 若当前仅有 advisory 或视图未完整覆盖，则完全不能根据缺失清理旧配置。
       for (const row of db.prepare('SELECT id FROM semantic_configs').all() as Array<{ id: string }>) {
-        if (!ids.has(row.id)) db.prepare('DELETE FROM semantic_configs WHERE id = ?').run(row.id);
+        if (!ids.has(row.id)) {
+          const nativeEdges = db.prepare(`SELECT e.id FROM edges e JOIN semantic_edge_configs m ON m.edge_id=e.id
+            WHERE e.provenance='libclang' AND m.config_id=?`).all(row.id) as Array<{ id: number }>;
+          db.prepare('DELETE FROM semantic_configs WHERE id = ?').run(row.id);
+          // 配置全集的正面退役独立于新配置 native 局部失败；不能全局清所有无归属边。
+          for (const edge of nativeEdges) db.prepare(`DELETE FROM edges WHERE id=? AND
+            NOT EXISTS (SELECT 1 FROM semantic_edge_configs WHERE edge_id=edges.id)`).run(edge.id);
+        }
       }
     }
     const now = Date.now();
@@ -357,7 +493,7 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
           label=excluded.label, compiler=excluded.compiler, flags_hash=excluded.flags_hash,
           authority=excluded.authority, metadata=excluded.metadata, updated_at=excluded.updated_at
       `).run(view.id, view.key, view.compiler ?? null, view.flagsHash,
-        authority, JSON.stringify({ grouping: view.grouping }), now);
+        authority, JSON.stringify({ grouping: view.grouping, ...(view.native ? { native: view.native } : {}) }), now);
       if (!view.success) continue;
       // 单视图只提供其真正覆盖文件的负面证据；其他文件即使未出现也保留。
       for (const file of view.coveredFiles) {
@@ -371,12 +507,17 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
     for (const fact of sorted) {
       const candidates = queries.getNodesByFile(fact.filePath)
         .filter(node => node.kind === fact.kind && node.name === fact.name &&
-          semanticRangesOverlap(node, fact))
+          semanticRangesOverlap(node, fact) && (!fact.external || (() => {
+            try { return JSON.parse(queries.getMetadata(`cpp_native:${node.id}`) ?? '{}').usr === fact.native!.usr; }
+            catch { return false; }
+          })()))
         .sort((a, b) => compareCandidate(a, b, fact));
       assertPairwiseSemanticOverlap(candidates);
       let winner = candidates[0];
       if (!winner) {
-        let id = generateNodeId(fact.filePath, fact.kind, fact.name, fact.startLine);
+        let id = fact.external ? `native-${createHash('sha256').update(JSON.stringify([
+          fact.filePath, fact.kind, fact.native!.usr, fact.startLine, fact.startColumn, fact.endLine, fact.endColumn])).digest('hex').slice(0, 24)}` :
+          generateNodeId(fact.filePath, fact.kind, fact.name, fact.startLine);
         const occupant = queries.getNodeById(id);
         if (occupant) {
           if (occupant.filePath !== fact.filePath || occupant.kind !== fact.kind ||
@@ -392,7 +533,7 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
           filePath: fact.filePath, language: /\.(?:c|h|i)$/i.test(fact.filePath) ? 'c' : 'cpp',
           startLine: fact.startLine, startColumn: fact.startColumn,
           endLine: fact.endLine, endColumn: fact.endColumn,
-          signature: fact.signature, semanticOrigin: 'clangd', updatedAt: now };
+          signature: fact.signature, semanticOrigin: fact.external ? 'libclang' : 'clangd', updatedAt: now };
         queries.insertNode(winner);
         used.nodesAdded++;
         retryNames.add(fact.name);
@@ -414,6 +555,8 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
           }
         }
       }
+      if (fact.native) queries.setMetadata(`cpp_native:${winner.id}`, JSON.stringify({ ...fact.native,
+        physicalFile: fact.filePath, external: !!fact.external }));
       db.prepare(`
         INSERT INTO semantic_node_configs (node_id,config_id,signature,definition_line,definition_col)
         VALUES (?,?,?,?,?) ON CONFLICT(node_id,config_id) DO UPDATE SET

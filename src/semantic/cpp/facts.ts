@@ -16,11 +16,31 @@ export interface SemanticSymbolIdentity {
   startColumn: number;
   endLine: number;
   endColumn: number;
+  /** 只有同 TU 原生直接绑定且物理声明完整时允许创建项目外 stub。 */
+  external?: boolean;
+}
+
+export interface NativeTargetEvidence {
+  usr: string;
+  linkage: number;
+  translationUnit: string;
+  contextHash: string;
+  declarationHash: string;
+  declarationFile?: string;
+  sourceHash?: string;
+  macroHash?: string;
+  libraryVersion: string;
+  /** 两次同点展开可共享图边，物理宏体锚点仍分别保留用于审计。 */
+  macroId?: string;
+  spellingFile?: string;
+  spellingLine?: number;
+  spellingColumn?: number;
 }
 
 export interface SemanticSymbolFact extends SemanticSymbolIdentity {
   configId: string;
   signature?: string;
+  native?: NativeTargetEvidence;
 }
 
 /**
@@ -92,6 +112,8 @@ export interface SemanticCallFact {
   callee: SemanticSymbolIdentity;
   callLine: number;
   callColumn: number;
+  provenance?: 'libclang';
+  native?: NativeTargetEvidence;
 }
 
 export interface StructuralTypedefContext {

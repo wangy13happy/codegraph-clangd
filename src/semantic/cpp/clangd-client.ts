@@ -1,6 +1,8 @@
 /** @file 只处理语义事实所需方法的 clangd stdio LSP 会话。 */
 import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
 import { pathToFileURL } from 'url';
+import { createHash, randomBytes } from 'crypto';
+import * as path from 'path';
 import type { MessageConnection } from 'vscode-jsonrpc/lib/node/main';
 // 旧式 TS moduleResolution 不读取包的 ./node 条件导出；运行时仍使用官方 Node 入口。
 const { createMessageConnection, CancellationTokenSource } = require('vscode-jsonrpc/node') as typeof import('vscode-jsonrpc/lib/node/main');
@@ -31,6 +33,26 @@ export interface LspCallHierarchyItem {
 }
 export interface LspIncomingCall { from: LspCallHierarchyItem; fromRanges: LspRange[] }
 export interface LspDefinition { uri: string; range: LspRange }
+
+export interface EffectiveCompileContext {
+  directory: string;
+  argv: string[];
+  triple: string;
+  clangdVersion: string;
+  documentVersion: number;
+  sessionId: string;
+  hash: string;
+}
+
+/**
+ * @brief 只解码已核验的 clangd 19 printArgv 简单 token 子集，不把日志当 shell。
+ * @param[in] value 原生日志中的参数行
+ * @return 无引号、控制符或 C 转义歧义时返回参数；否则返回 null 并降级
+ */
+export function decodeSimpleClangdArgv(value: string): string[] | null {
+  if (!value || /[^\x20-\x7e]|["'\\]/.test(value) || value.trim() !== value || value.includes('  ')) return null;
+  return value.split(' ');
+}
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_SYNC_TIMEOUT_MS = 10 * 60_000;
@@ -71,6 +93,16 @@ export class ClangdClient {
   private readonly timeoutMs: number;
   private readonly syncTimeoutMs: number;
   private readonly documentErrors = new Map<string, boolean>();
+  private readonly sessionId = randomBytes(16).toString('hex');
+  private readonly openedFiles = new Set<string>();
+  private readonly commands = new Map<string, { directory: string; argv: string[]; triple?: string }>();
+  private readonly ambiguousCommands = new Set<string>();
+  private logBuffer = '';
+  private discardingLogLine = false;
+  private logBytes = 0;
+  private logOverflow = false;
+  private loggedVersion = '';
+  private pendingCommand: { file: string; stage: 'directory' | 'argv'; directory?: string } | undefined;
 
   /**
    * @brief 建立惰性 clangd 客户端，仅接受用户侧已验证的运行时授权。
@@ -98,14 +130,15 @@ export class ClangdClient {
     if (this.initialized) return;
     if (this.stopped || this.signal?.aborted) throw new Error('clangd session cancelled');
     if (!this.runtime.clangdPath) throw new Error('Trusted clangd executable is unavailable');
-    const args = [`--compile-commands-dir=${this.compileDirectory}`, '--background-index', '--log=error'];
+    const args = [`--compile-commands-dir=${this.compileDirectory}`, '--background-index', '--log=verbose'];
     if (this.runtime.queryDrivers.length) args.push(`--query-driver=${this.runtime.queryDrivers.join(',')}`);
     const child = spawn(this.runtime.clangdPath, args, { cwd: this.root, stdio: ['pipe', 'pipe', 'pipe'] });
     this.child = child;
     this.childClosed = new Promise(resolve => child.once('close', resolve));
     child.on('error', () => { this.stopped = true; });
     child.on('close', () => { this.stopped = true; });
-    child.stderr.resume();
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => this.collectEffectiveContext(chunk));
     this.signal?.addEventListener('abort', this.onAbort, { once: true });
     try {
       const connection = createMessageConnection(child.stdout, child.stdin);
@@ -158,6 +191,7 @@ export class ClangdClient {
   didOpen(uri: string, languageId: string, text: string): void {
     if (!this.initialized || !this.connection || this.stopped) throw new Error('clangd session not initialized');
     this.documentErrors.delete(uri);
+    this.openedFiles.add(decodeURIComponent(new URL(uri).pathname));
     this.connection.sendNotification('textDocument/didOpen', { textDocument: { uri, languageId, version: 1, text } });
   }
 
@@ -176,6 +210,88 @@ export class ClangdClient {
    */
   hasCleanDiagnostics(uri: string): boolean {
     return this.documentErrors.get(uri) === false;
+  }
+
+  /**
+   * @brief 有界采集同一进程的真实 ASTWorker command 和 cc1 target，不保存普通协议日志。
+   * @param[in] chunk stderr 新到达的 UTF-8 日志片段
+   * @return 无；截断、歧义或不受支持的日志格式令对应上下文不可用
+   */
+  private collectEffectiveContext(chunk: string): void {
+    if (this.logOverflow) return;
+    if (this.discardingLogLine) {
+      const end = chunk.indexOf('\n');
+      if (end < 0) return;
+      chunk = chunk.slice(end + 1); this.discardingLogLine = false;
+    }
+    this.logBuffer += chunk;
+    for (;;) {
+      const end = this.logBuffer.indexOf('\n');
+      if (end < 0) break;
+      const raw = this.logBuffer.slice(0, end).replace(/\r$/, '');
+      this.logBuffer = this.logBuffer.slice(end + 1);
+      const line = raw.replace(/^[IVDE]\[\d{2}:\d{2}:\d{2}\.\d{3}\] /, '');
+      if (Buffer.byteLength(raw) > 256 * 1024) {
+        // verbose LSP 正文可能单行很长；不保存它，也不能因此否定已完整收集的其他 TU context。
+        // 若命令块本身越界，只把该 TU 记为未知，绝不截断后拼成 argv。
+        if (this.pendingCommand) this.ambiguousCommands.add(this.pendingCommand.file);
+        this.pendingCommand = undefined; continue;
+      }
+      const version = line.match(/\bclangd version (19\.\d+\.\d+)\b/);
+      if (version) this.loggedVersion = version[1]!;
+      const build = line.match(/^ASTWorker building file (.+) version 1 with command(?: .*)?$/);
+      if (build) {
+        this.pendingCommand = this.openedFiles.has(build[1]!) ? { file: build[1]!, stage: 'directory' } : undefined;
+        continue;
+      }
+      if (this.pendingCommand) {
+        const pending = this.pendingCommand;
+        if (pending.stage === 'directory' && /^\[[^\r\n]+\]$/.test(line)) {
+          pending.directory = line.slice(1, -1); pending.stage = 'argv'; continue;
+        }
+        if (pending.stage === 'argv') {
+          const argv = decodeSimpleClangdArgv(line);
+          this.logBytes += Buffer.byteLength(line);
+          if (this.logBytes > 2 * 1024 * 1024 || this.commands.size >= 128) this.logOverflow = true;
+          const existing = this.commands.get(pending.file);
+          if (argv && pending.directory && path.isAbsolute(pending.directory) && !this.logOverflow) {
+            if (existing && JSON.stringify([existing.directory, existing.argv]) !== JSON.stringify([pending.directory, argv]))
+              this.ambiguousCommands.add(pending.file);
+            else this.commands.set(pending.file, { directory: pending.directory, argv });
+          } else this.ambiguousCommands.add(pending.file);
+        } else this.ambiguousCommands.add(pending.file);
+        this.pendingCommand = undefined;
+      }
+      const cc1 = line.match(/^(?:Driver produced command: |internal \(cc1\) args are: )(.*)$/);
+      if (!cc1?.[1]) continue;
+      const argv = decodeSimpleClangdArgv(cc1[1]);
+      if (!argv) continue;
+      const file = argv[argv.length - 1]!;
+      const command = this.commands.get(file);
+      const tripleIndex = argv.indexOf('-triple');
+      if (!command || tripleIndex < 0 || !argv[tripleIndex + 1]) continue;
+      const triple = argv[tripleIndex + 1]!;
+      if (command.triple && command.triple !== triple) this.ambiguousCommands.add(file);
+      else command.triple = triple;
+    }
+    if (Buffer.byteLength(this.logBuffer) > 256 * 1024) {
+      if (this.pendingCommand) this.ambiguousCommands.add(this.pendingCommand.file);
+      this.pendingCommand = undefined; this.logBuffer = ''; this.discardingLogLine = true;
+    }
+  }
+
+  /**
+   * @brief 取已打开 version 1 文档的同会话 effective command；不读取旧日志或 CDB 猜测参数。
+   * @param[in] mainFile 已打开主文件的绝对路径
+   * @return 真实版本、target、argv 与会话哈希；不完整或歧义时返回 null
+   */
+  effectiveCompileContext(mainFile: string): EffectiveCompileContext | null {
+    const command = this.commands.get(mainFile);
+    if (this.logOverflow || this.ambiguousCommands.has(mainFile) || !this.loggedVersion || !command?.triple) return null;
+    const hash = createHash('sha256').update(JSON.stringify([this.sessionId, mainFile, 1,
+      this.loggedVersion, command.directory, command.argv, command.triple])).digest('hex');
+    return { ...command, triple: command.triple, clangdVersion: this.loggedVersion,
+      documentVersion: 1, sessionId: this.sessionId, hash };
   }
 
   /**

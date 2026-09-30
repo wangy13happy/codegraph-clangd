@@ -167,7 +167,7 @@ export interface Node {
   signature?: string;
 
   /** Provenance of an opt-in C/C++ repair node; structural declarations need not be active. */
-  semanticOrigin?: 'clangd' | 'source-structure';
+  semanticOrigin?: 'clangd' | 'source-structure' | 'libclang';
 
   /** Visibility modifier */
   visibility?: 'public' | 'private' | 'protected' | 'internal';
@@ -226,7 +226,7 @@ export interface Edge {
   column?: number;
 
   /** How this edge was created */
-  provenance?: 'tree-sitter' | 'scip' | 'heuristic' | 'clangd';
+  provenance?: 'tree-sitter' | 'scip' | 'heuristic' | 'clangd' | 'libclang';
 }
 
 /**
@@ -431,6 +431,8 @@ export interface TraversalOptions {
  * Options for searching the graph
  */
 export interface SearchOptions {
+  /** 符号检索默认稳定分段排序；自然语言探索的逐词候选保留既有语境排序。 */
+  intent?: 'symbol' | 'prose';
   /** Node types to search */
   kinds?: NodeKind[];
 

@@ -24,7 +24,8 @@ describe('C/C++ semantic repair configuration', () => {
     clearProjectConfigCache();
     expect(loadCppSemanticRepairConfig(root)).toEqual({ enabled: true, mode: 'union' });
     for (const settings of [{ enabled: 'true' }, { enabled: true, mode: 'replace' },
-      { enabled: true, clangdPath: '/usr/bin/clangd' }, { enabled: true, queryDrivers: ['/usr/bin/cc'] }]) {
+      { enabled: true, clangdPath: '/usr/bin/clangd' }, { enabled: true, queryDrivers: ['/usr/bin/cc'] },
+      { enabled: true, nativePythonPath: '/usr/bin/python3' }, { enabled: true, nativeLibclangPath: '/tmp/libclang.so' }]) {
       fs.writeFileSync(path.join(root, 'codegraph.json'), JSON.stringify({ cppSemanticRepair: settings }));
       clearProjectConfigCache();
       expect(loadCppSemanticRepairConfig(root)).toBeNull();
@@ -57,12 +58,18 @@ describe('C/C++ semantic repair configuration', () => {
     const clangd = path.join(root, 'clangd');
     fs.writeFileSync(clangd, '#!/bin/sh\n');
     fs.chmodSync(clangd, 0o755);
+    const nativePython = path.join(root, 'native-python');
+    const nativeLibrary = path.join(root, 'native-library');
+    fs.writeFileSync(nativePython, '#!/bin/sh\n'); fs.chmodSync(nativePython, 0o755);
+    fs.writeFileSync(nativeLibrary, 'runtime fixture');
     const env = { CODEGRAPH_CLANGD_PATH: clangd,
       CODEGRAPH_CLANGD_QUERY_DRIVERS: '/usr/bin/cc,/opt/toolchain/bin/*',
-      CODEGRAPH_COMPILE_COMMANDS: path.join(root, 'external.json') };
+      CODEGRAPH_COMPILE_COMMANDS: path.join(root, 'external.json'),
+      CODEGRAPH_NATIVE_PYTHON_PATH: nativePython, CODEGRAPH_LIBCLANG_PATH: nativeLibrary };
     fs.writeFileSync(env.CODEGRAPH_COMPILE_COMMANDS, '[]');
     expect(resolveCppSemanticRuntimeOptions({}, env)).toEqual({ clangdPath: clangd,
-      queryDrivers: ['/usr/bin/cc', '/opt/toolchain/bin/*'], compileCommands: env.CODEGRAPH_COMPILE_COMMANDS });
+      queryDrivers: ['/usr/bin/cc', '/opt/toolchain/bin/*'], compileCommands: env.CODEGRAPH_COMPILE_COMMANDS,
+      nativePythonPath: nativePython, nativeLibclangPath: nativeLibrary });
     expect(resolveCppSemanticRuntimeOptions({ clangdPath: 'tools/clangd', clangdQueryDrivers: '../gcc' }, env))
       .toMatchObject({ clangdPath: null, queryDrivers: [] });
     expect(resolveCppSemanticRuntimeOptions({ clangdPath: 'clangd' }, {})).toMatchObject({ clangdPath: 'clangd' });

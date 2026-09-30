@@ -559,6 +559,7 @@ export class ContextBuilder {
         if (titleCased === sym) continue; // already title-case (e.g., "Engine") — handled by exact match
         // Fetch more results since popular prefixes have many matches
         const prefixResults = this.queries.searchNodes(titleCased, {
+          intent: 'prose',
           limit: 30,
           kinds: definitionKinds,
         });
@@ -606,6 +607,7 @@ export class ContextBuilder {
              'route', 'component'] as NodeKind[];
         for (const term of searchTerms) {
           const termResults = this.queries.searchNodes(term, {
+            intent: isDistinctiveIdentifier(term) ? 'symbol' : 'prose',
             limit: opts.searchLimit * 2,
             kinds: searchKinds,
           });

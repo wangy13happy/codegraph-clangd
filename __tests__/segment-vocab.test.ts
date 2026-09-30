@@ -129,13 +129,18 @@ export function validate_file_md5(): boolean { return true; }
       let graph: CodeGraph | undefined;
       try {
         for (const file of order) {
-          fs.writeFileSync(path.join(sandbox, file), 'export function VerifyArchiveMD5(): boolean { return true; }\n');
+          fs.writeFileSync(path.join(sandbox, file), 'export function VerifyArchiveMD5(): boolean { return true; }\nexport function checksum(): boolean { return true; }\n');
         }
         graph = await CodeGraph.init(sandbox, { silent: true });
         await graph.indexAll();
         const paths = graph.searchNodes('MD5', { limit: 10 }).map(result => result.node.filePath);
         expect(paths).toEqual(['a.ts', 'z.ts']);
         expect(graph.searchNodes('MD5', { limit: 10 }).map(result => result.node.filePath)).toEqual(paths);
+        // 完整小写标识符不能依赖 camelCase 特征或数据库枚举顺序；同名定义仍须稳定排序。
+        expect(graph.searchNodes('checksum', { limit: 10 }).map(result => result.node.filePath))
+          .toEqual(['a.ts', 'z.ts']);
+        expect(graph.searchNodes('checksum', { intent: 'symbol', limit: 10 }).map(result => result.node.filePath))
+          .toEqual(['a.ts', 'z.ts']);
       } finally {
         graph?.destroy();
         fs.rmSync(sandbox, { recursive: true, force: true });
