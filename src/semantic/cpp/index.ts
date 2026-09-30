@@ -55,7 +55,7 @@ export interface CppSemanticInputs {
   error?: string;
 }
 
-const REPAIR_ALGORITHM_VERSION = 1;
+const REPAIR_ALGORITHM_VERSION = 2;
 
 /**
  * @brief 在可信用户侧运行时解析语义输入并散列修复算法、工具、数据库原始字节与配置。

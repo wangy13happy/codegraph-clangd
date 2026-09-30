@@ -8,7 +8,7 @@ import { QueryBuilder } from '../src/db/queries';
 import { generateNodeId, semanticCollisionNodeId } from '../src/extraction/tree-sitter-helpers';
 import { extractFromSource } from '../src/extraction/tree-sitter';
 import { initGrammars, loadGrammarsForLanguages } from '../src/extraction/grammars';
-import { reconcileCppSemanticNodes } from '../src/semantic/cpp/reconciler';
+import { reconcileCppSemanticNodes, reconcileCppStructuralMacros } from '../src/semantic/cpp/reconciler';
 import { collectCppSemanticFacts, SemanticFactCollection } from '../src/semantic/cpp';
 import { createResolver } from '../src/resolution';
 import { Node } from '../src/types';
@@ -84,6 +84,58 @@ describe('C/C++ semantic node reconciliation', () => {
       kind: 'function', name, qualifiedName: name, language: 'c', startLine: line,
       endLine, startColumn: 0, endColumn: 1, updatedAt: 1 };
   }
+
+  it('stores complete source-structure macro ranges without claiming an active compile view', async () => {
+    const file = path.join(directory, 'sample.h');
+    fs.writeFileSync(file, [
+      '#define SET_STATE(v) \\', 'do {\\', '  lock();\\',
+      '  state = (v);\\', '  unlock();\\', '} while(0)', '',
+    ].join('\n'));
+    queries.upsertFile({ path: 'sample.h', contentHash: 'fixture', language: 'c', size: 60,
+      modifiedAt: 1, indexedAt: 1, nodeCount: 0 });
+    fs.writeFileSync(path.join(directory, 'main.c'), '#include "sample.h"\nvoid run(void) { SET_STATE(1); }\n');
+    expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'], true)).toBe(1);
+    const node = queries.getNodesByFile('sample.h')[0]!;
+    expect(node).toMatchObject({ kind: 'constant', name: 'SET_STATE', startLine: 1,
+      endLine: 6, semanticOrigin: 'source-structure' });
+    expect(conn.getDb().prepare('SELECT * FROM semantic_node_configs WHERE node_id = ?').all(node.id)).toEqual([]);
+    expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c', 'main.c'], true)).toBe(0);
+    fs.writeFileSync(file, '#define GET_STATE() (state)\n');
+    fs.writeFileSync(path.join(directory, 'main.c'), '#include "sample.h"\nvoid run(void) { GET_STATE(); }\n');
+    expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'], true)).toBe(1);
+    expect(queries.getNodesByFile('sample.h').map(current => current.name)).toEqual(['GET_STATE']);
+  });
+
+  it('bounds macro facts by direct local include and syntax usage, preserving partial evidence', async () => {
+    fs.writeFileSync(path.join(directory, 'sample.h'), '#define USED(x) (x)\n#define UNUSED(x) (x)\n');
+    fs.writeFileSync(path.join(directory, 'dependency.h'), '#define USED(x) ((x) + 1)\n');
+    fs.writeFileSync(path.join(directory, 'main.c'), '#include "sample.h"\nvoid run(void) { USED(1); /* UNUSED(1); */ }\n');
+    for (const file of ['sample.h', 'dependency.h']) queries.upsertFile({ path: file,
+      contentHash: 'fixture', language: 'c', size: 60, modifiedAt: 1, indexedAt: 1, nodeCount: 0 });
+    expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'])).toBe(1);
+    expect(queries.getNodesByFile('sample.h').map(node => node.name)).toEqual(['USED']);
+    expect(queries.getNodesByFile('dependency.h')).toEqual([]);
+    fs.writeFileSync(path.join(directory, 'main.c'), '#include "sample.h"\nvoid run(void) {}\n');
+    expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c', 'missing.c'], true)).toBe(0);
+    expect(queries.getNodesByFile('sample.h')).toHaveLength(1);
+    await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c']);
+    expect(queries.getNodesByFile('sample.h')).toHaveLength(1);
+    await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'], true);
+    expect(queries.getNodesByFile('sample.h')).toEqual([]);
+  });
+
+  it('keeps only syntax-used macros from a directly quoted vendored SDK header', async () => {
+    fs.mkdirSync(path.join(directory, 'vendor'));
+    fs.writeFileSync(path.join(directory, 'vendor', 'sdk.h'), [
+      '#define SDK_USED(x) (x)', ...Array.from({ length: 500 }, (_unused, index) =>
+        `#define SDK_UNUSED_${index}(x) (x)`), '',
+    ].join('\n'));
+    fs.writeFileSync(path.join(directory, 'main.c'), '#include "vendor/sdk.h"\nvoid run(void) { SDK_USED(1); }\n');
+    queries.upsertFile({ path: 'vendor/sdk.h', contentHash: 'fixture', language: 'c',
+      size: 20000, modifiedAt: 1, indexedAt: 1, nodeCount: 0 });
+    expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'])).toBe(1);
+    expect(queries.getNodesByFile('vendor/sdk.h').map(node => node.name)).toEqual(['SDK_USED']);
+  });
 
   it('merges conditional signatures and their shared body into one identity', () => {
     const input = collection(['one', 'two'], [fact('one', 'variant.c', 'feature', 2, 12),

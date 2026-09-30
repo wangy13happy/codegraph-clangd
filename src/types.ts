@@ -166,8 +166,8 @@ export interface Node {
   /** Function/method signature */
   signature?: string;
 
-  /** Present only when semantic repair created this canonical node identity. */
-  semanticOrigin?: 'clangd';
+  /** Provenance of an opt-in C/C++ repair node; structural declarations need not be active. */
+  semanticOrigin?: 'clangd' | 'source-structure';
 
   /** Visibility modifier */
   visibility?: 'public' | 'private' | 'protected' | 'internal';

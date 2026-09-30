@@ -1,11 +1,130 @@
 /** @file C/C++ 语义节点归并、配置 provenance 和保守退役。 */
+import * as fs from 'fs';
 import * as path from 'path';
+import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { SqliteDatabase } from '../../db/sqlite-adapter';
 import { QueryBuilder } from '../../db/queries';
+import { getParser, loadGrammarsForLanguages } from '../../extraction/grammars';
 import { generateNodeId, semanticCollisionNodeId } from '../../extraction/tree-sitter-helpers';
 import { Node } from '../../types';
+import { isWithinProject } from './compile-database';
 import { SemanticFactCollection } from './index';
 import { SemanticSymbolFact, semanticRangesOverlap, assertPairwiseSemanticOverlap } from './facts';
+
+/**
+ * @brief 为编译 TU 直接包含且实际使用的本地头文件宏保存完整结构范围。
+ * @param[in] root 项目根目录，读取前会校验真实文件仍在根目录内
+ * @param[in] db 当前语义修复事务使用的数据库连接
+ * @param[in] queries 当前图节点读写接口
+ * @param[in] translationUnits 编译数据库中的项目相对 TU 路径；不会扫描依赖 TU 或递归 include
+ * @param[in] allowRetirement 权威采集完整时允许退役不再有结构候选的旧宏
+ * @return 本轮新建的宏定义节点数量；缺失语法或文件时跳过相应文件
+ */
+export async function reconcileCppStructuralMacros(root: string, db: SqliteDatabase,
+  queries: QueryBuilder, translationUnits: string[], allowRetirement = false): Promise<number> {
+  // 普通提取运行在解析 worker；主线程需为此 opt-in 阶段单独加载 C 语法。
+  await loadGrammarsForLanguages(['c']);
+  const parser = getParser('c');
+  if (!parser) return 0;
+  let added = 0;
+  let complete = true;
+  const referenced = new Map<string, Set<string>>();
+  const tracked = new Map(queries.getAllFiles().map(file => [file.path, file]));
+  for (const unit of new Set(translationUnits)) {
+    let source: string;
+    try {
+      const absolute = fs.realpathSync(path.join(root, unit));
+      if (!isWithinProject(root, absolute) || !fs.statSync(absolute).isFile()) { complete = false; continue; }
+      source = fs.readFileSync(absolute, 'utf8');
+    } catch { complete = false; continue; }
+    const tree = parser.parse(source);
+    if (!tree) { complete = false; continue; }
+    const names = new Set<string>();
+    const headers = new Set<string>();
+    /**
+     * @brief 收集 TU 的语法标识符与直接本地 include，避免依赖宏全集污染主图。
+     * @param[in] syntax 当前 Tree-sitter 节点
+     * @return 无；名字仅筛选结构候选，不证明宏绑定或预处理分支生效
+     */
+    const collect = (syntax: SyntaxNode): void => {
+      if (syntax.type === 'identifier') names.add(syntax.text);
+      if (syntax.type === 'preproc_include') {
+        const included = syntax.childForFieldName('path');
+        // 仅解析引号 include 的包含文件相对路径；不猜测 -I 搜索顺序或遍历 SDK。
+        if (included?.type === 'string_literal') {
+          try {
+            const absolute = fs.realpathSync(path.resolve(root, path.dirname(unit), included.text.slice(1, -1)));
+            const relative = path.relative(root, absolute).replace(/\\/g, '/');
+            if (isWithinProject(root, absolute) && tracked.has(relative)) headers.add(relative);
+          } catch { complete = false; }
+        }
+      }
+      for (const child of syntax.namedChildren) collect(child);
+    };
+    collect(tree.rootNode);
+    tree.delete();
+    for (const header of headers) {
+      const used = referenced.get(header) ?? new Set<string>();
+      for (const name of names) used.add(name);
+      referenced.set(header, used);
+    }
+  }
+  const retained = new Set<string>();
+  for (const file of queries.getAllFiles()) {
+    const usedNames = referenced.get(file.path);
+    if (!usedNames || (file.language !== 'c' && file.language !== 'cpp') || !/\.(?:h|hh|hpp|hxx)$/i.test(file.path)) continue;
+    let source: string;
+    try {
+      const absolute = fs.realpathSync(path.join(root, file.path));
+      if (!isWithinProject(root, absolute) || !fs.statSync(absolute).isFile()) { complete = false; continue; }
+      source = fs.readFileSync(absolute, 'utf8');
+    } catch { complete = false; continue; }
+    const lines = source.split('\n');
+    const existing = new Map(queries.getNodesByFile(file.path).map(node => [node.id, node]));
+    const tree = parser.parse(source);
+    if (!tree) { complete = false; continue; }
+    /**
+     * @brief 遍历 C 结构预处理定义并保留宏真实源码跨度。
+     * @param[in] syntax 当前 Tree-sitter 节点
+     * @return 无；仅将完整名称与位置构成的节点加入待写入集合
+     */
+    const visit = (syntax: SyntaxNode): void => {
+      if (syntax.type === 'preproc_def' || syntax.type === 'preproc_function_def') {
+        const identifier = syntax.namedChild(0);
+        if (identifier?.type === 'identifier' && usedNames.has(identifier.text)) {
+          const name = identifier.text;
+          const startLine = syntax.startPosition.row + 1;
+          const id = generateNodeId(file.path, 'constant', name, startLine);
+          retained.add(id);
+          if (!existing.has(id) || existing.get(id)?.semanticOrigin === 'source-structure') {
+            // Tree-sitter 的结束位置为半开区间；行首结束不能包含下一行源码。
+            const endLine = syntax.endPosition.row + (syntax.endPosition.column === 0 ? 0 : 1);
+            const node: Node = { id, kind: 'constant', name, qualifiedName: name,
+              filePath: file.path, language: file.language,
+              startLine, startColumn: syntax.startPosition.column,
+              endLine: Math.max(startLine, endLine), endColumn: syntax.endPosition.column,
+              signature: lines[syntax.startPosition.row]?.trimEnd(),
+              semanticOrigin: 'source-structure', updatedAt: Date.now() };
+            if (existing.has(id)) queries.updateNode(node);
+            else { queries.insertNode(node); added++; }
+            existing.set(id, node);
+          }
+        }
+      }
+      for (const child of syntax.namedChildren) visit(child);
+    };
+    db.transaction(() => visit(tree.rootNode))();
+    tree.delete();
+  }
+  if (complete && allowRetirement) {
+    // 结构退役只作用于本路径创建的宏；任何 TU/头文件读取失败时保留旧正向事实。
+    for (const row of db.prepare("SELECT id FROM nodes WHERE semantic_origin = 'source-structure' AND kind = 'constant'")
+      .all() as Array<{ id: string }>) {
+      if (!retained.has(row.id)) queries.deleteNode(row.id);
+    }
+  }
+  return added;
+}
 
 /**
  * @brief 拒绝未能安全映射到图节点的事实，避免部分 SQL 更新后被当作完整清单提交。

@@ -56,7 +56,7 @@ import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
 import { loadDeprioritizePatterns } from './project-config';
 import { collectCppSemanticFacts, resolveCppSemanticInputs, CppSemanticInputs } from './semantic/cpp';
-import { reconcileCppSemanticNodes } from './semantic/cpp/reconciler';
+import { reconcileCppSemanticNodes, reconcileCppStructuralMacros } from './semantic/cpp/reconciler';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
@@ -508,9 +508,16 @@ export class CodeGraph {
           view.id === id && view.success && view.coveredFiles.includes(file))));
       const nodeTransactionStarted = Date.now();
       const repaired = reconcileCppSemanticNodes(this.db.getDb(), this.queries, facts);
+      // 宏的源码结构不等同于编译视图绑定；仅 opt-in 修复路径存独立来源。
+      const macrosStarted = Date.now();
+      const macrosAdded = await reconcileCppStructuralMacros(this.projectRoot, this.db.getDb(), this.queries,
+        inputs.database.entries.map(entry => entry.file), facts.inventory === 'authoritative' &&
+          facts.views.every(view => view.success && view.inventory === 'authoritative'));
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
+        `[semantic-timing] structural-macros: ${Date.now() - macrosStarted}ms added=${macrosAdded}`);
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
         `[semantic-timing] node-reconciliation: ${Date.now() - nodeTransactionStarted}ms`);
-      status.nodesAdded = repaired.nodesAdded;
+      status.nodesAdded = repaired.nodesAdded + macrosAdded;
       this.resolver.clearCaches();
       const retryable = this.queries.getRetryableFailedReferences(repaired.retryNames);
       const retryStarted = Date.now();
