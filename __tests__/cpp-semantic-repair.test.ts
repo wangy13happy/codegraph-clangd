@@ -957,6 +957,105 @@ describe('C/C++ semantic node reconciliation', () => {
     expect(queries.getNodeById(macro.id)).not.toBeNull();
   });
 
+  it.each([undefined, 'heuristic', 'libclang'] as const)('bounds repeated partial native supports and preserves %s creation', provenance => {
+    fs.writeFileSync(path.join(directory, 'caller.c'), 'void caller(void) { CALL(); }\n');
+    fs.writeFileSync(path.join(directory, 'variant.c'), 'void feature(void) {}\n');
+    for (const file of ['a.h', 'b.h']) fs.writeFileSync(path.join(directory, file), '#define CALL() feature()\n');
+    const caller = baseline('caller.c', 'caller', 1, 1); caller.endColumn = 30;
+    const target = baseline('variant.c', 'feature', 1, 1); target.endColumn = 25;
+    const macros = ['a.h', 'b.h'].map(file => ({ ...baseline(file, 'CALL', 1, 1),
+      kind: 'constant' as const, semanticOrigin: 'source-structure' as const, endColumn: 25 }));
+    queries.insertNodes([caller, target, ...macros]);
+    queries.insertEdge({ source: caller.id, target: target.id, kind: 'calls', line: 1, column: 20,
+      provenance, metadata: { refName: 'feature', refKind: 'calls' } });
+    const input = collection(['one', 'two'], ['one', 'two'].flatMap(id => [
+      { ...fact(id, 'caller.c', 'caller', 1, 1), endColumn: 30 },
+      { ...fact(id, 'variant.c', 'feature', 1, 1), endColumn: 25 },
+    ]));
+    for (const view of input.views) {
+      view.coveredFiles = ['caller.c', 'variant.c']; view.analyzedTuCount = 2;
+      view.native = { attemptedTus: 1, failedTus: 1, durationMs: 1, bytes: 1, visited: 10001,
+        contexts: view.id === 'one' ? ['a'.repeat(64), 'd'.repeat(64)] : ['b'.repeat(64)],
+        reasons: ['caller.c: native AST budget exceeded'], coveredFiles: [], failedFiles: ['caller.c'],
+        macroIds: macros.map(macro => macro.id), structuralComplete: true };
+    }
+    input.calls = ['one', 'two'].map((id, index) => ({ configId: id,
+      caller: input.symbols.find(symbol => symbol.configId === id && symbol.filePath === 'caller.c')!,
+      callee: input.symbols.find(symbol => symbol.configId === id && symbol.filePath === 'variant.c')!,
+      callLine: 1, callColumn: 20, provenance: 'libclang', native: {
+        usr: 'c:@F@feature', linkage: 4, translationUnit: 'caller.c', contextHash: (index ? 'b' : 'a').repeat(64),
+        declarationHash: nativeDeclarationHash(path.join(directory, 'variant.c')),
+        declarationFile: path.join(directory, 'variant.c'), sourceHash: nativeDeclarationHash(path.join(directory, 'caller.c')),
+        macroHash: nativeDeclarationHash(path.join(directory, macros[index]!.filePath)), libraryVersion: 'clang version 19.1.7',
+        macroId: macros[index]!.id, spellingFile: path.join(directory, macros[index]!.filePath), spellingLine: 1, spellingColumn: 15,
+      } }));
+    input.calls.push({ ...input.calls[0]!, native: { ...input.calls[0]!.native!, spellingColumn: 17 } });
+    reconcileCppSemanticNodes(conn.getDb(), queries, input); queries.reconcileCppSemanticCalls(input);
+    const row = conn.getDb().prepare('SELECT id,metadata FROM edges WHERE source=?').get(caller.id) as { id: number; metadata: string };
+    const metadata = JSON.parse(row.metadata);
+    // 模拟旧版本已累积的同支持记录；只允许保存的 context 清单恢复它们的真实 config。
+    const legacy = { ...metadata.nativeExpansions[0], contextHash: 'd'.repeat(64) };
+    delete legacy.configId; delete metadata.nativeExpansions[0].configId;
+    const unknown = { ...metadata.nativeExpansions[1], contextHash: 'e'.repeat(64) }; delete unknown.configId;
+    metadata.nativeExpansions.unshift(legacy); metadata.nativeExpansions.push(unknown);
+    metadata.native = legacy;
+    conn.getDb().prepare('UPDATE edges SET metadata=? WHERE id=?').run(JSON.stringify(metadata), row.id);
+    invalidateCppNativeDeclarations(conn.getDb(), queries, directory);
+    const migrated = queries.getOutgoingEdges(caller.id)[0]!.metadata!.nativeExpansions as Array<{ configId?: string; contextHash: string }>;
+    // heuristic 不接受 semantic edge membership，故其未知旧配置必须保留而不能猜成 one。
+    expect(migrated).toHaveLength(provenance === 'heuristic' ? 5 : 4);
+    input.calls = [input.calls[0]!];
+    const sizes: number[] = [];
+    for (let pass = 0; pass < 5; pass++) {
+      input.calls[0]!.native!.contextHash = createHash('sha256').update(`session-${pass}`).digest('hex');
+      queries.reconcileCppSemanticCalls(input);
+      const saved = queries.getOutgoingEdges(caller.id)[0]!;
+      const expansions = saved.metadata!.nativeExpansions as Array<{ configId?: string; contextHash: string; spellingColumn: number }>;
+      expect(conn.getDb().prepare('SELECT id FROM edges WHERE source=?').get(caller.id)).toEqual({ id: row.id });
+      expect(saved).toMatchObject({ provenance: provenance ?? null });
+      expect(saved.metadata).toMatchObject({ refName: 'feature', refKind: 'calls' });
+      expect(expansions).toHaveLength(provenance === 'heuristic' ? 6 : 4);
+      expect(expansions.find(evidence => evidence.configId === 'one' && evidence.spellingColumn === 15)?.contextHash)
+        .toBe(input.calls[0]!.native!.contextHash);
+      expect(expansions.some(evidence => evidence.contextHash === unknown.contextHash && !evidence.configId)).toBe(true);
+      sizes.push(Buffer.byteLength(JSON.stringify(saved.metadata)));
+    }
+    expect(new Set(sizes).size).toBe(1);
+    fs.writeFileSync(path.join(directory, 'a.h'), '#define CALL() ((void)0)\n');
+    invalidateCppNativeDeclarations(conn.getDb(), queries, directory);
+    expect(queries.getOutgoingEdges(caller.id)[0]!.metadata?.nativeExpansions).toHaveLength(2);
+    expect(conn.getDb().prepare('SELECT config_id FROM semantic_node_configs WHERE node_id=?').all(macros[0]!.id)).toEqual([]);
+    expect(conn.getDb().prepare('SELECT config_id FROM semantic_node_configs WHERE node_id=?').all(macros[1]!.id))
+      .toEqual([{ config_id: 'two' }]);
+    fs.unlinkSync(path.join(directory, 'b.h')); invalidateCppNativeDeclarations(conn.getDb(), queries, directory);
+    if (provenance === 'libclang') expect(queries.getOutgoingEdges(caller.id)).toEqual([]);
+    else expect(queries.getOutgoingEdges(caller.id)[0]).toMatchObject({ provenance: provenance ?? null,
+      metadata: { refName: 'feature', refKind: 'calls' } });
+  });
+
+  it('does not merge independently different physical native supports', () => {
+    const caller = baseline('caller.c', 'caller', 10, 30); const target = baseline('variant.c', 'feature', 2, 8);
+    queries.insertNodes([caller, target]);
+    const base = { configId: 'one', usr: 'c:@F@feature', linkage: 4, translationUnit: 'caller.c',
+      contextHash: 'a'.repeat(64), declarationHash: 'b'.repeat(64), declarationFile: '/declaration.h',
+      sourceHash: 'c'.repeat(64), macroHash: 'd'.repeat(64), libraryVersion: 'clang version 19.1.7',
+      macroId: 'macro', spellingFile: '/macros.h', spellingLine: 1, spellingColumn: 15 };
+    const alternatives = [{ configId: 'two' }, { translationUnit: 'another.c' }, { macroId: 'other-macro' },
+      { spellingFile: '/another.h' }, { spellingLine: 2 }, { spellingColumn: 17 }, { usr: 'c:@F@other' },
+      { linkage: 3 }, { declarationFile: '/other-declaration.h' }, { declarationHash: 'e'.repeat(64) },
+      { sourceHash: 'f'.repeat(64) }, { macroHash: '0'.repeat(64) }, { libraryVersion: 'clang version 19.1.8' }];
+    queries.insertEdge({ source: caller.id, target: target.id, kind: 'calls', line: 14, column: 4,
+      provenance: 'libclang', metadata: { native: base, nativeExpansions: [base] } });
+    const edge = conn.getDb().prepare('SELECT id FROM edges WHERE source=?').get(caller.id) as { id: number };
+    const incomplete = { ...base, sourceHash: undefined };
+    queries.reconcileCppNativeExpansions(edge.id, [base, ...alternatives.map(alternative => ({ ...base, ...alternative })),
+      { ...base, contextHash: '1'.repeat(64) }, incomplete, { ...incomplete, contextHash: '2'.repeat(64) }]);
+    const saved = queries.getOutgoingEdges(caller.id)[0]!.metadata!.nativeExpansions as typeof base[];
+    expect(saved).toHaveLength(alternatives.length + 3);
+    expect(saved[0]!.contextHash).toBe('1'.repeat(64));
+    for (const alternative of alternatives) expect(saved).toContainEqual({ ...base, ...alternative });
+  });
+
   it.each([undefined, 'heuristic'] as const)('retains %s creation and ordinary metadata when native macro support retires', provenance => {
     const caller = baseline('caller.c', 'caller', 10, 30); const target = baseline('variant.c', 'feature', 2, 8);
     const macro: Node = { ...baseline('macros.h', 'CALL', 1, 1), id: 'macro', kind: 'constant',

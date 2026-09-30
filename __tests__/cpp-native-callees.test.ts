@@ -112,6 +112,42 @@ describe('same-session native macro targets', () => {
     } finally { graph.destroy(); process.env = saved; }
   }, 30_000);
 
+  it.skipIf(!runtimeAvailable)('keeps actual partial macro supports bounded across different clangd sessions', async () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-native-partial-')); temporary.push(parent);
+    const root = path.join(parent, 'project'); fs.mkdirSync(root);
+    const external = path.join(parent, 'external.h'); fs.writeFileSync(external, 'extern void sink(int);\n');
+    fs.writeFileSync(path.join(root, 'macros.h'), `#include "${external}"\n#define EMIT(x) do { sink(x); sink(x); } while(0)\n`);
+    const source = path.join(root, 'main.c');
+    // 无关函数体会被现有 exporter 剪枝；顶层声明仍消耗真实遍历预算，不能靠 mock 制造 partial。
+    fs.writeFileSync(source, '#include "macros.h"\nvoid run(void) { EMIT(1); }\n' +
+      Array.from({ length: 10000 }, (_unused, index) => `int state_${index};\n`).join(''));
+    fs.writeFileSync(path.join(root, 'codegraph.json'), JSON.stringify({ cppSemanticRepair: { enabled: true } }));
+    fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify([{ directory: root, file: source,
+      output: 'build/CMakeFiles/app.dir/main.c.o', arguments: ['/usr/bin/cc', '-c', source] }]));
+    const saved = { ...process.env }; process.env.CODEGRAPH_CLANGD_PATH = '/usr/bin/clangd-19';
+    delete process.env.CODEGRAPH_COMPILE_COMMANDS; delete process.env.CODEGRAPH_CLANGD_QUERY_DRIVERS;
+    const graph = await CodeGraph.init(root, { silent: true });
+    try {
+      const contexts: string[] = []; const sizes: number[] = [];
+      for (let pass = 0; pass < 3; pass++) {
+        if (!pass) await graph.indexAll(); else await graph.sync();
+        const status = graph.getCppSemanticRepairStatus();
+        expect(status, JSON.stringify(status)).toMatchObject({ state: 'partial', translationUnits: 1, viewsFailed: 0,
+          native: { attemptedTus: 1, failedTus: 1, visited: 10001 } });
+        expect(status!.native!.reasons).toContain('main.c: native AST budget exceeded');
+        const caller = graph.searchNodes('run')[0]!.node;
+        const targets = graph.getCallees(caller.id).filter(item => item.edge.provenance === 'libclang');
+        expect(targets).toHaveLength(1); expect(targets[0]!.node).toMatchObject({ name: 'sink', filePath: external });
+        const expansions = targets[0]!.edge.metadata!.nativeExpansions as Array<{ contextHash: string; spellingColumn: number }>;
+        expect(expansions).toHaveLength(2);
+        expect(new Set(expansions.map(evidence => evidence.spellingColumn)).size).toBe(2);
+        expect(new Set(expansions.map(evidence => evidence.contextHash)).size).toBe(1);
+        contexts.push(expansions[0]!.contextHash); sizes.push(Buffer.byteLength(JSON.stringify(targets[0]!.edge.metadata)));
+      }
+      expect(new Set(contexts).size).toBe(3); expect(new Set(sizes).size).toBe(1);
+    } finally { graph.destroy(); process.env = saved; }
+  }, 30_000);
+
   it.skipIf(!runtimeAvailable)('exports only physical macro direct calls, not callback arguments, fnptrs or ordinary external calls', async () => {
     const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-native-boundaries-')); temporary.push(parent);
     const root = path.join(parent, 'project'); fs.mkdirSync(root);

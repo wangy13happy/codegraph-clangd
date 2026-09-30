@@ -528,7 +528,7 @@ export class QueryBuilder {
   }
 
   /**
-   * @brief 对账同一调用边的存活原生展开，仅撤销已失去物理支持的自有归属。
+   * @brief 对账同一调用边的存活原生展开，合并已证明相同的物理支持并撤销失效归属。
    * @param[in] edgeId 既有调用边 ID；普通及 heuristic 边的创建来源不会改变
    * @param[in] expansions 输入失效或完整 native scope 筛选后仍存活的展开
    * @return 删除的 libclang 自有边数量；普通及 heuristic 边始终保留
@@ -559,7 +559,26 @@ export class QueryBuilder {
       return configs.length ? configs.map(member => ({ ...evidence, configId: member.config_id })) : [evidence];
     };
     const old = previous.flatMap(bind);
-    const retained = expansions.flatMap(bind);
+    const retained: NativeTargetEvidence[] = [];
+    const supports = new Map<string, number>();
+    for (const evidence of expansions.flatMap(bind)) {
+      // 调用边已限定 caller、target 和调用坐标；完整物理输入及真实 config 才能证明支持相同。
+      // 随机会话 contextHash 只更新审计记录。旧配置不可映射或关键输入未知时不归并，不猜绑定。
+      const key = evidence.configId && evidence.declarationFile && evidence.sourceHash && evidence.macroHash &&
+        evidence.macroId && evidence.spellingFile && evidence.spellingLine !== undefined && evidence.spellingColumn !== undefined
+        ? JSON.stringify([evidence.configId, evidence.translationUnit, evidence.usr, evidence.linkage,
+          evidence.macroId, evidence.spellingFile, evidence.spellingLine, evidence.spellingColumn,
+          evidence.declarationFile, evidence.declarationHash, evidence.sourceHash, evidence.macroHash, evidence.libraryVersion])
+        : undefined;
+      const index = key === undefined ? undefined : supports.get(key);
+      if (index === undefined) {
+        if (key !== undefined) supports.set(key, retained.length);
+        retained.push(evidence);
+      } else {
+        // 旧记录在前、本轮正向事实在后；保留原位置并更新最新审计，partial 未重采支持仍存活。
+        retained[index] = evidence;
+      }
+    }
     if (retained.length) {
       metadata.native = retained[0]; metadata.nativeExpansions = retained;
     } else { delete metadata.native; delete metadata.nativeExpansions; }
