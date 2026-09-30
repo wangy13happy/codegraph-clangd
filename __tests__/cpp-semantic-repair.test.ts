@@ -9,7 +9,8 @@ import { generateNodeId, semanticCollisionNodeId } from '../src/extraction/tree-
 import { extractFromSource } from '../src/extraction/tree-sitter';
 import { initGrammars, loadGrammarsForLanguages } from '../src/extraction/grammars';
 import { reconcileCppSemanticNodes, reconcileCppStructuralMacros, reconcileCppStructuralTypedefs,
-  reconcileCppTypedefBindings } from '../src/semantic/cpp/reconciler';
+  reconcileCppTypedefBindings, invalidateCppNativeDeclarations } from '../src/semantic/cpp/reconciler';
+import { nativeDeclarationHash } from '../src/semantic/cpp/native-callees';
 import { collectCppSemanticFacts, SemanticFactCollection } from '../src/semantic/cpp';
 import { createResolver } from '../src/resolution';
 import { Node } from '../src/types';
@@ -19,6 +20,9 @@ vi.mock('../src/semantic/cpp', async importOriginal => ({
   ...await importOriginal<typeof import('../src/semantic/cpp')>(),
   collectCppSemanticFacts: vi.fn(),
 }));
+
+// 普通文件接口仍全部使用真实实现；仅 unknown I/O 用例临时替换单个接口。
+vi.mock('fs', async importOriginal => ({ ...await importOriginal<typeof import('fs')>() }));
 
 describe('C/C++ semantic node reconciliation', () => {
   let directory: string;
@@ -95,15 +99,15 @@ describe('C/C++ semantic node reconciliation', () => {
     queries.upsertFile({ path: 'sample.h', contentHash: 'fixture', language: 'c', size: 60,
       modifiedAt: 1, indexedAt: 1, nodeCount: 0 });
     fs.writeFileSync(path.join(directory, 'main.c'), '#include "sample.h"\nvoid run(void) { SET_STATE(1); }\n');
-    expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'], true)).toBe(1);
+    expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'])).toBe(1);
     const node = queries.getNodesByFile('sample.h')[0]!;
     expect(node).toMatchObject({ kind: 'constant', name: 'SET_STATE', startLine: 1,
       endLine: 6, semanticOrigin: 'source-structure' });
     expect(conn.getDb().prepare('SELECT * FROM semantic_node_configs WHERE node_id = ?').all(node.id)).toEqual([]);
-    expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c', 'main.c'], true)).toBe(0);
+    expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c', 'main.c'])).toBe(0);
     fs.writeFileSync(file, '#define GET_STATE() (state)\n');
     fs.writeFileSync(path.join(directory, 'main.c'), '#include "sample.h"\nvoid run(void) { GET_STATE(); }\n');
-    expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'], true)).toBe(1);
+    expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'])).toBe(1);
     expect(queries.getNodesByFile('sample.h').map(current => current.name)).toEqual(['GET_STATE']);
   });
 
@@ -111,18 +115,35 @@ describe('C/C++ semantic node reconciliation', () => {
     fs.writeFileSync(path.join(directory, 'sample.h'), '#define USED(x) (x)\n#define UNUSED(x) (x)\n');
     fs.writeFileSync(path.join(directory, 'dependency.h'), '#define USED(x) ((x) + 1)\n');
     fs.writeFileSync(path.join(directory, 'main.c'), '#include "sample.h"\nvoid run(void) { USED(1); /* UNUSED(1); */ }\n');
-    for (const file of ['sample.h', 'dependency.h']) queries.upsertFile({ path: file,
-      contentHash: 'fixture', language: 'c', size: 60, modifiedAt: 1, indexedAt: 1, nodeCount: 0 });
-    expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'])).toBe(1);
-    expect(queries.getNodesByFile('sample.h').map(node => node.name)).toEqual(['USED']);
-    expect(queries.getNodesByFile('dependency.h')).toEqual([]);
-    fs.writeFileSync(path.join(directory, 'main.c'), '#include "sample.h"\nvoid run(void) {}\n');
-    expect(await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c', 'missing.c'], true)).toBe(0);
-    expect(queries.getNodesByFile('sample.h')).toHaveLength(1);
-    await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c']);
-    expect(queries.getNodesByFile('sample.h')).toHaveLength(1);
-    await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'], true);
-    expect(queries.getNodesByFile('sample.h')).toEqual([]);
+    fs.writeFileSync(path.join(directory, 'codegraph.json'), JSON.stringify({ cppSemanticRepair: { enabled: true } }));
+    fs.writeFileSync(path.join(directory, 'compile_commands.json'), JSON.stringify([{
+      directory, file: 'main.c', arguments: ['cc', '-c', 'main.c'], output: 'CMakeFiles/app.dir/main.c.o',
+    }]));
+    const complete = collection(['one'], []); complete.views[0]!.coveredFiles = ['main.c'];
+    vi.mocked(collectCppSemanticFacts).mockResolvedValue(complete);
+    const saved = { ...process.env }; process.env.CODEGRAPH_CLANGD_PATH = '/usr/bin/clangd-19';
+    delete process.env.CODEGRAPH_COMPILE_COMMANDS;
+    const graph = await CodeGraph.init(directory, { silent: true });
+    try {
+      await graph.indexAll();
+      expect(graph.getNodesInFile('sample.h').filter(node => node.kind === 'constant').map(node => node.name)).toEqual(['USED']);
+      expect(graph.getNodesInFile('dependency.h').filter(node => node.kind === 'constant')).toEqual([]);
+      fs.writeFileSync(path.join(directory, 'main.c'), '#include "sample.h"\n#include "missing.h"\nvoid run(void) {}\n');
+      await graph.sync();
+      expect(graph.getCppSemanticRepairStatus()?.state).toBe('partial');
+      expect(graph.getNodesInFile('sample.h').filter(node => node.kind === 'constant')).toHaveLength(1);
+      await graph.sync();
+      expect(graph.getNodesInFile('sample.h').filter(node => node.kind === 'constant')).toHaveLength(1);
+      // 结构扫描完整仍不允许 advisory 清单退役；原产品后置 authority 门槛必须保留。
+      fs.writeFileSync(path.join(directory, 'main.c'), '#include "sample.h"\nvoid run(void) {}\n');
+      vi.mocked(collectCppSemanticFacts).mockResolvedValue({ ...complete, inventory: 'advisory' });
+      await graph.sync();
+      expect(graph.getNodesInFile('sample.h').filter(node => node.kind === 'constant')).toHaveLength(1);
+      vi.mocked(collectCppSemanticFacts).mockResolvedValue(complete);
+      await graph.indexAll();
+      expect(graph.getCppSemanticRepairStatus()?.state).toBe('complete');
+      expect(graph.getNodesInFile('sample.h').filter(node => node.kind === 'constant')).toEqual([]);
+    } finally { graph.destroy(); process.env = saved; vi.mocked(collectCppSemanticFacts).mockReset(); }
   });
 
   it('keeps only syntax-used macros from a directly quoted vendored SDK header', async () => {
@@ -145,12 +166,12 @@ describe('C/C++ semantic node reconciliation', () => {
     queries.upsertFile({ path: 'sample.h', contentHash: 'fixture', language: 'c', size: 26,
       modifiedAt: 1, indexedAt: 1, nodeCount: 0 });
     const first = { nodes: [] as Node[], complete: true };
-    await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'], false, first);
+    await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'], first);
     expect(first.complete).toBe(false); const oldId = first.nodes[0]!.id;
     fs.writeFileSync(header, '\n#define AFTER(x) sink(x)\n');
     fs.writeFileSync(unit, '#include "sample.h"\n#include "unavailable.h"\nvoid run(void) { AFTER(1); }\n');
     const second = { nodes: [] as Node[], complete: true };
-    await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'], false, second);
+    await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['main.c'], second);
     expect(second.complete).toBe(false); expect(queries.getNodeById(oldId)).toBeNull();
     expect(queries.getNodesByFile('sample.h')).toMatchObject([{ name: 'AFTER', startLine: 2, endLine: 2 }]);
     fs.writeFileSync(header, '\n');
@@ -882,8 +903,216 @@ describe('C/C++ semantic node reconciliation', () => {
     reconcileCppSemanticNodes(conn.getDb(), queries, input);
     expect(conn.getDb().prepare('SELECT config_id FROM semantic_edge_configs WHERE edge_id=?').all(edge.id!))
       .toEqual([{ config_id: 'one' }]);
+    expect(queries.getOutgoingEdges(caller.id)[0]!.metadata?.nativeExpansions).toHaveLength(1);
     expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 0, removed: 1 });
     expect(queries.getOutgoingEdges(caller.id)).toEqual([]);
+  });
+
+  it('retires macro view bindings only after the last complete TU support disappears', () => {
+    const macro: Node = { ...baseline('macros.h', 'CALL', 1, 1), id: 'macro', kind: 'constant',
+      semanticOrigin: 'source-structure', endColumn: 30 };
+    queries.insertNodes([macro, baseline('caller.c', 'caller', 10, 30),
+      baseline('another.c', 'another', 10, 30), baseline('variant.c', 'feature', 2, 8)]);
+    const input = collection(['one', 'two'], ['one', 'two'].flatMap(id => [
+      fact(id, 'caller.c', 'caller', 10, 30), fact(id, 'another.c', 'another', 10, 30),
+      fact(id, 'variant.c', 'feature', 2, 8),
+    ]));
+    for (const view of input.views) {
+      view.coveredFiles = ['caller.c', 'another.c', 'variant.c']; view.analyzedTuCount = 3;
+      view.native = { attemptedTus: 2, failedTus: 0, durationMs: 1, bytes: 1, visited: 1,
+        contexts: [], reasons: [], coveredFiles: ['caller.c', 'another.c'], failedFiles: [],
+        macroIds: [macro.id], structuralComplete: true };
+    }
+    input.calls = [['one', 'caller.c', 'caller'], ['one', 'another.c', 'another'],
+      ['two', 'caller.c', 'caller']].map(([configId, file, name]) => ({ configId: configId!,
+        caller: fact(configId!, file!, name!, 10, 30), callee: fact(configId!, 'variant.c', 'feature', 2, 8),
+        callLine: 14, callColumn: 4, provenance: 'libclang', native: {
+          usr: 'c:@F@feature', linkage: 4, translationUnit: file!, contextHash: `${configId}-${file}`,
+          declarationHash: 'b'.repeat(64), libraryVersion: 'clang version 19.1.7',
+          macroId: macro.id, spellingFile: '/fixture.h', spellingLine: 1, spellingColumn: 1,
+        } }));
+    reconcileCppSemanticNodes(conn.getDb(), queries, input);
+    queries.reconcileCppSemanticCalls(input);
+    expect(conn.getDb().prepare('SELECT config_id FROM semantic_node_configs WHERE node_id=? ORDER BY config_id')
+      .all(macro.id)).toEqual([{ config_id: 'one' }, { config_id: 'two' }]);
+    const scoped = { ...input, calls: [], views: [input.views[0]!], scopeFiles: ['caller.c'],
+      expectedViewsByFile: { 'caller.c': ['one'] } };
+    queries.reconcileCppSemanticCalls({ ...scoped, inventory: 'advisory' });
+    const partial = { ...scoped, views: [{ ...scoped.views[0]!, native: {
+      ...scoped.views[0]!.native!, coveredFiles: [], failedFiles: ['caller.c'], failedTus: 1 } }] };
+    queries.reconcileCppSemanticCalls(partial);
+    expect(queries.getOutgoingEdges(generateNodeId('caller.c', 'function', 'caller', 10))).toHaveLength(1);
+    queries.reconcileCppSemanticCalls(scoped);
+    // 同 view 的另一 TU 尚有真实展开；头文件结构存在不能代替这份正向支持。
+    expect(conn.getDb().prepare('SELECT config_id FROM semantic_node_configs WHERE node_id=? ORDER BY config_id')
+      .all(macro.id)).toEqual([{ config_id: 'one' }, { config_id: 'two' }]);
+    queries.reconcileCppSemanticCalls({ ...scoped, scopeFiles: ['another.c'],
+      expectedViewsByFile: { 'another.c': ['one'] } });
+    expect(queries.getNodeById(macro.id)).not.toBeNull();
+    expect(conn.getDb().prepare('SELECT config_id FROM semantic_node_configs WHERE node_id=?')
+      .all(macro.id)).toEqual([{ config_id: 'two' }]);
+    expect(queries.getOutgoingEdges(generateNodeId('caller.c', 'function', 'caller', 10))).toHaveLength(1);
+    queries.reconcileCppSemanticCalls({ ...input, calls: [] });
+    expect(conn.getDb().prepare('SELECT * FROM semantic_node_configs WHERE node_id=?').all(macro.id)).toEqual([]);
+    expect(queries.getNodeById(macro.id)).not.toBeNull();
+  });
+
+  it.each([undefined, 'heuristic'] as const)('retains %s creation and ordinary metadata when native macro support retires', provenance => {
+    const caller = baseline('caller.c', 'caller', 10, 30); const target = baseline('variant.c', 'feature', 2, 8);
+    const macro: Node = { ...baseline('macros.h', 'CALL', 1, 1), id: 'macro', kind: 'constant',
+      semanticOrigin: 'source-structure', endColumn: 30 };
+    queries.insertNodes([caller, target, macro]);
+    queries.insertEdge({ source: caller.id, target: target.id, kind: 'calls', line: 14, column: 4,
+      provenance, metadata: { refName: 'feature', refKind: 'calls' } });
+    const input = collection(['one'], [fact('one', 'caller.c', 'caller', 10, 30),
+      fact('one', 'variant.c', 'feature', 2, 8)]);
+    input.views[0]!.coveredFiles = ['caller.c', 'variant.c']; input.views[0]!.analyzedTuCount = 2;
+    input.views[0]!.native = { attemptedTus: 1, failedTus: 0, durationMs: 1, bytes: 1, visited: 1,
+      contexts: [], reasons: [], coveredFiles: ['caller.c'], failedFiles: [], macroIds: [macro.id], structuralComplete: true };
+    const ordinary = { configId: 'one', caller: fact('one', 'caller.c', 'caller', 10, 30),
+      callee: fact('one', 'variant.c', 'feature', 2, 8), callLine: 14, callColumn: 4 };
+    input.calls = [{ ...ordinary, provenance: 'libclang', native: { usr: 'c:@F@feature', linkage: 4,
+      translationUnit: 'caller.c', contextHash: 'context', declarationHash: 'b'.repeat(64),
+      libraryVersion: 'clang version 19.1.7', macroId: macro.id, spellingFile: '/fixture.h', spellingLine: 1, spellingColumn: 1 } }];
+    reconcileCppSemanticNodes(conn.getDb(), queries, input); queries.reconcileCppSemanticCalls(input);
+    expect(conn.getDb().prepare('SELECT config_id FROM semantic_node_configs WHERE node_id=?').all(macro.id))
+      .toEqual([{ config_id: 'one' }]);
+    input.calls = [ordinary]; queries.reconcileCppSemanticCalls(input);
+    expect(queries.getOutgoingEdges(caller.id)).toMatchObject([{ provenance: provenance ?? null,
+      metadata: { refName: 'feature', refKind: 'calls' } }]);
+    expect(queries.getOutgoingEdges(caller.id)[0]!.metadata?.nativeExpansions).toBeUndefined();
+    expect(conn.getDb().prepare('SELECT * FROM semantic_node_configs WHERE node_id=?').all(macro.id)).toEqual([]);
+  });
+
+  it('replaces a complete native target without losing the still-active macro binding or edge identity', () => {
+    const caller = baseline('caller.c', 'caller', 10, 30);
+    const first = baseline('variant.c', 'first', 2, 8); const second = baseline('variant.c', 'second', 10, 15);
+    const macro: Node = { ...baseline('macros.h', 'CALL', 1, 1), id: 'macro', kind: 'constant',
+      semanticOrigin: 'source-structure', endColumn: 30 };
+    queries.insertNodes([caller, first, second, macro]);
+    const input = collection(['one'], [fact('one', 'caller.c', 'caller', 10, 30),
+      fact('one', 'variant.c', 'first', 2, 8), fact('one', 'variant.c', 'second', 10, 15)]);
+    input.views[0]!.coveredFiles = ['caller.c', 'variant.c']; input.views[0]!.analyzedTuCount = 2;
+    input.views[0]!.native = { attemptedTus: 1, failedTus: 0, durationMs: 1, bytes: 1, visited: 1,
+      contexts: [], reasons: [], coveredFiles: ['caller.c'], failedFiles: [], macroIds: [macro.id], structuralComplete: true };
+    input.calls = [{ configId: 'one', caller: fact('one', 'caller.c', 'caller', 10, 30),
+      callee: fact('one', 'variant.c', 'first', 2, 8), callLine: 14, callColumn: 4, provenance: 'libclang',
+      native: { usr: 'c:@F@first', linkage: 4, translationUnit: 'caller.c', contextHash: 'context',
+        declarationHash: 'b'.repeat(64), libraryVersion: 'clang version 19.1.7', macroId: macro.id,
+        spellingFile: '/fixture.h', spellingLine: 1, spellingColumn: 1 } }];
+    reconcileCppSemanticNodes(conn.getDb(), queries, input); queries.reconcileCppSemanticCalls(input);
+    const unchangedId = (conn.getDb().prepare('SELECT id FROM edges').get() as { id: number }).id;
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 0, removed: 0 });
+    expect((conn.getDb().prepare('SELECT id FROM edges').get() as { id: number }).id).toBe(unchangedId);
+    input.calls[0]!.callee = fact('one', 'variant.c', 'second', 10, 15);
+    input.calls[0]!.native!.usr = 'c:@F@second';
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 1, removed: 1 });
+    expect(queries.getOutgoingEdges(caller.id).map(edge => edge.target)).toEqual([second.id]);
+    expect(conn.getDb().prepare('SELECT config_id FROM semantic_node_configs WHERE node_id=?').all(macro.id))
+      .toEqual([{ config_id: 'one' }]);
+  });
+
+  it.each(['inputs', 'structure'])('invalidates a non-first expansion through %s without losing independent or unknown evidence', async route => {
+    const source = path.join(directory, 'caller.c');
+    fs.writeFileSync(source, '#include "a.h"\n#include "b.h"\nvoid caller(void) { CALL(); }\n');
+    for (const file of ['a.h', 'b.h']) {
+      fs.writeFileSync(path.join(directory, file), '#define CALL() feature()\n');
+      queries.upsertFile({ path: file, language: 'c', size: 24, contentHash: 'fixture',
+        modifiedAt: 1, indexedAt: 1, nodeCount: 0 });
+    }
+    await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['caller.c']);
+    const caller = baseline('caller.c', 'caller', 3, 3); caller.endColumn = 40;
+    const target = baseline('variant.c', 'feature', 2, 8); queries.insertNodes([caller, target]);
+    fs.writeFileSync(path.join(directory, 'variant.c'), 'void feature(void) {}\n');
+    const input = collection(['one', 'two'], ['one', 'two'].flatMap(id => [
+      { ...fact(id, 'caller.c', 'caller', 3, 3), endColumn: 40 }, fact(id, 'variant.c', 'feature', 2, 8),
+    ]));
+    for (const view of input.views) {
+      view.coveredFiles = ['caller.c', 'variant.c']; view.analyzedTuCount = 2;
+      view.native = { attemptedTus: 1, failedTus: 0, durationMs: 1, bytes: 1, visited: 1,
+        contexts: [view.id], reasons: [], coveredFiles: ['caller.c'], failedFiles: [],
+        macroIds: queries.getNodesByKind('constant').map(node => node.id), structuralComplete: true };
+    }
+    input.calls = ['one', 'two'].map((id, index) => {
+      const file = index ? 'b.h' : 'a.h';
+      return { configId: id, caller: { ...fact(id, 'caller.c', 'caller', 3, 3), endColumn: 40 },
+        callee: fact(id, 'variant.c', 'feature', 2, 8), callLine: 3, callColumn: 20,
+        provenance: 'libclang', native: { usr: 'c:@F@feature', linkage: 4, translationUnit: 'caller.c',
+          contextHash: id, declarationHash: nativeDeclarationHash(path.join(directory, 'variant.c')),
+          declarationFile: path.join(directory, 'variant.c'), sourceHash: nativeDeclarationHash(source),
+          macroHash: nativeDeclarationHash(path.join(directory, file)), libraryVersion: 'clang version 19.1.7',
+          macroId: queries.getNodesByFile(file)[0]!.id, spellingFile: path.join(directory, file),
+          spellingLine: 1, spellingColumn: 15 } };
+    });
+    reconcileCppSemanticNodes(conn.getDb(), queries, input); queries.reconcileCppSemanticCalls(input);
+    if (route === 'inputs') {
+      // 原协议的聚合证据没有 configId；真实已保存 context 清单足以迁移，不需重采或猜测。
+      const row = conn.getDb().prepare("SELECT id,metadata FROM edges WHERE provenance='libclang'").get() as
+        { id: number; metadata: string };
+      const legacy = JSON.parse(row.metadata); delete legacy.native.configId;
+      for (const evidence of legacy.nativeExpansions) delete evidence.configId;
+      conn.getDb().prepare('UPDATE edges SET metadata=? WHERE id=?').run(JSON.stringify(legacy), row.id);
+    }
+    queries.insertEdge({ source: caller.id, target: target.id, kind: 'calls', line: 3, column: 1 });
+    queries.insertEdge({ source: caller.id, target: target.id, kind: 'calls', line: 3, column: 2, provenance: 'heuristic' });
+    const physicalStat = fs.statSync;
+    const unknown = vi.spyOn(fs, 'statSync').mockImplementation((file, options) => {
+      if (file === path.join(directory, 'b.h')) throw Object.assign(new Error('unavailable'), { code: 'EACCES' });
+      return physicalStat(file, options as any) as any;
+    });
+    try {
+      invalidateCppNativeDeclarations(conn.getDb(), queries, directory);
+      expect(queries.getOutgoingEdges(caller.id).find(edge => edge.provenance === 'libclang')!.metadata?.nativeExpansions)
+        .toHaveLength(2);
+    } finally { unknown.mockRestore(); }
+    fs.writeFileSync(path.join(directory, 'b.h'), '#define CALL() ((void)0)\n');
+    if (route === 'inputs') invalidateCppNativeDeclarations(conn.getDb(), queries, directory);
+    else await reconcileCppStructuralMacros(directory, conn.getDb(), queries, ['caller.c', 'missing.c']);
+    const native = queries.getOutgoingEdges(caller.id).find(edge => edge.provenance === 'libclang')!;
+    expect(native.metadata?.nativeExpansions).toHaveLength(1);
+    const nativeRow = conn.getDb().prepare("SELECT id FROM edges WHERE source=? AND provenance='libclang'").get(caller.id) as { id: number };
+    expect(conn.getDb().prepare('SELECT config_id FROM semantic_edge_configs WHERE edge_id=?').all(nativeRow.id))
+      .toEqual([{ config_id: 'one' }]);
+    input.calls = input.calls.filter(call => call.configId === 'one');
+    // 普通调用也提供自身正向事实；不能把 ordinary 完整快照的合法退役误计为 native 失效。
+    input.calls.push({ configId: 'one', caller: { ...fact('one', 'caller.c', 'caller', 3, 3), endColumn: 40 },
+      callee: fact('one', 'variant.c', 'feature', 2, 8), callLine: 3, callColumn: 1 });
+    input.views[1]!.native!.coveredFiles = []; input.views[1]!.native!.failedFiles = ['caller.c'];
+    input.views[1]!.native!.failedTus = 1;
+    queries.reconcileCppSemanticCalls(input);
+    expect(queries.getOutgoingEdges(caller.id).find(edge => edge.provenance === 'libclang')!.metadata?.nativeExpansions)
+      .toHaveLength(1);
+    fs.unlinkSync(path.join(directory, 'a.h'));
+    invalidateCppNativeDeclarations(conn.getDb(), queries, directory);
+    expect(queries.getOutgoingEdges(caller.id).map(edge => edge.provenance)).toEqual([null, 'heuristic']);
+  });
+
+  it('matches external same-range targets by validated USR rather than choosing or dropping a view', () => {
+    const external = path.join(directory, 'sdk.h'); fs.writeFileSync(external, 'extern void sink(number);\n');
+    queries.insertNode(baseline('caller.c', 'caller', 10, 30));
+    const input = collection(['one', 'two'], ['one', 'two'].flatMap(id => [
+      fact(id, 'caller.c', 'caller', 10, 30), { ...fact(id, external, 'sink', 1, 1), endColumn: 24,
+        external: true, native: { usr: id === 'one' ? 'c:@F@sink#I#' : 'c:@F@sink#L#',
+          linkage: 4, translationUnit: 'caller.c', contextHash: 'a'.repeat(64),
+          declarationHash: nativeDeclarationHash(external), libraryVersion: 'clang version 19.1.7' } },
+    ]));
+    for (const view of input.views) {
+      view.coveredFiles = ['caller.c']; view.native = { attemptedTus: 1, failedTus: 0, durationMs: 1,
+        bytes: 1, visited: 1, contexts: [], reasons: [], coveredFiles: ['caller.c'], failedFiles: [],
+        macroIds: [], structuralComplete: true };
+    }
+    input.calls = ['one', 'two'].map(id => ({ configId: id,
+      caller: fact(id, 'caller.c', 'caller', 10, 30),
+      callee: input.symbols.find(symbol => symbol.configId === id && symbol.external)!,
+      callLine: 14, callColumn: 4, provenance: 'libclang',
+      native: input.symbols.find(symbol => symbol.configId === id && symbol.external)!.native }));
+    reconcileCppSemanticNodes(conn.getDb(), queries, input);
+    expect(queries.getNodesByFile(external)).toHaveLength(2);
+    expect(queries.reconcileCppSemanticCalls(input)).toEqual({ added: 2, removed: 0 });
+    expect(queries.getNodesByFile(external)).toHaveLength(2);
+    expect(conn.getDb().prepare(`SELECT m.config_id,n.name FROM semantic_edge_configs m
+      JOIN edges e ON e.id=m.edge_id JOIN nodes n ON n.id=e.target ORDER BY m.config_id`).all())
+      .toEqual([{ config_id: 'one', name: 'sink' }, { config_id: 'two', name: 'sink' }]);
   });
 
   it('corrects a wrong static target only with complete coverage and retains heuristic dispatch', () => {

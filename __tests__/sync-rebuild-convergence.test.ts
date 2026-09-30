@@ -673,15 +673,15 @@ describe('C/C++ semantic sync convergence', () => {
     vi.mocked(collectCppSemanticFacts).mockImplementation(real.collectCppSemanticFacts);
     graph = CodeGraph.initSync(root);
     await graph.indexAll();
-    expect(graph.getCppSemanticRepairStatus()?.state).toBe('complete');
+    expect(graph.getCppSemanticRepairStatus()?.state, JSON.stringify(graph.getCppSemanticRepairStatus())).toBe('complete');
     fs.writeFileSync(path.join(root, 'a.c'), '// shifted\nint target(void) { return 1; }\n');
     await graph.sync();
-    expect(graph.getCppSemanticRepairStatus()?.state).toBe('complete');
+    expect(graph.getCppSemanticRepairStatus()?.state, JSON.stringify(graph.getCppSemanticRepairStatus())).toBe('complete');
     const synced = snapshot();
     graph.destroy();
     graph = await CodeGraph.recreate(root);
     await graph.indexAll();
-    expect(graph.getCppSemanticRepairStatus()?.state).toBe('complete');
+    expect(graph.getCppSemanticRepairStatus()?.state, JSON.stringify(graph.getCppSemanticRepairStatus())).toBe('complete');
     expect(snapshot()).toEqual(synced);
   }, 30_000);
 });

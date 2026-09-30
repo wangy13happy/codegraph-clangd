@@ -24,6 +24,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
 import { semanticRangesOverlap, assertPairwiseSemanticOverlap,
   areDisjointCppIdCollisions } from '../semantic/cpp/facts';
+import type { NativeTargetEvidence } from '../semantic/cpp/facts';
 import { generateNodeId, semanticCollisionNodeId } from '../extraction/tree-sitter-helpers';
 import type { SemanticFactCollection, SemanticSymbolIdentity, SemanticCallFact } from '../semantic/cpp';
 
@@ -527,6 +528,66 @@ export class QueryBuilder {
   }
 
   /**
+   * @brief 对账同一调用边的存活原生展开，仅撤销已失去物理支持的自有归属。
+   * @param[in] edgeId 既有调用边 ID；普通及 heuristic 边的创建来源不会改变
+   * @param[in] expansions 输入失效或完整 native scope 筛选后仍存活的展开
+   * @return 删除的 libclang 自有边数量；普通及 heuristic 边始终保留
+   */
+  reconcileCppNativeExpansions(edgeId: number, expansions: NativeTargetEvidence[]): number {
+    const edge = this.db.prepare('SELECT metadata,provenance FROM edges WHERE id=?').get(edgeId) as
+      { metadata: string | null; provenance: string | null } | undefined;
+    if (!edge) return 0;
+    const metadata = safeJsonParse(edge.metadata ?? '{}', {}) as Record<string, unknown>;
+    const previous = (Array.isArray(metadata.nativeExpansions) ? metadata.nativeExpansions :
+      metadata.native ? [metadata.native] : []) as NativeTargetEvidence[];
+    // 旧协议没有 configId；只用当时保存的真实 context 清单恢复，无法证明时保守保留。
+    const members = previous.concat(expansions).some(evidence => !evidence.configId) ? this.db.prepare(`
+      SELECT m.config_id,c.metadata FROM semantic_edge_configs m
+      JOIN semantic_configs c ON c.id=m.config_id WHERE m.edge_id=?`).all(edgeId) as
+      Array<{ config_id: string; metadata: string | null }> : [];
+    /**
+     * @brief 为旧展开恢复可证明的视图归属，不把其他视图的输入猜成相同上下文。
+     * @param[in] evidence 旧或本轮的物理展开证据
+     * @return 已绑定的证据集合；没有可靠映射时保留未绑定记录
+     */
+    const bind = (evidence: NativeTargetEvidence): NativeTargetEvidence[] => {
+      if (evidence.configId) return [evidence];
+      const configs = members.filter(member => {
+        const saved = safeJsonParse(member.metadata ?? '{}', {}) as { native?: { contexts?: string[] } };
+        return saved.native?.contexts?.includes(evidence.contextHash);
+      });
+      return configs.length ? configs.map(member => ({ ...evidence, configId: member.config_id })) : [evidence];
+    };
+    const old = previous.flatMap(bind);
+    const retained = expansions.flatMap(bind);
+    if (retained.length) {
+      metadata.native = retained[0]; metadata.nativeExpansions = retained;
+    } else { delete metadata.native; delete metadata.nativeExpansions; }
+    let removed = 0;
+    if (edge.provenance === 'libclang' && !retained.length) removed = this.db.prepare('DELETE FROM edges WHERE id=?').run(edgeId).changes;
+    else {
+      const serialized = Object.keys(metadata).length ? JSON.stringify(metadata) : null;
+      if (serialized !== edge.metadata) this.db.prepare('UPDATE edges SET metadata=? WHERE id=?').run(serialized, edgeId);
+      if (edge.provenance === 'libclang' && retained.every(evidence => evidence.configId)) this.db.prepare(`
+        DELETE FROM semantic_edge_configs WHERE edge_id=? AND config_id NOT IN (SELECT value FROM json_each(?))`)
+        .run(edgeId, JSON.stringify([...new Set(retained.map(evidence => evidence.configId))]));
+    }
+    // 宏 membership 属于真实展开的 union；另一 TU/调用点仍支持时不能撤销头文件归属。
+    for (const evidence of old) {
+      if (!evidence.macroId || !evidence.configId || retained.some(candidate =>
+        candidate.macroId === evidence.macroId && candidate.configId === evidence.configId)) continue;
+      this.db.prepare(`DELETE FROM semantic_node_configs WHERE node_id=? AND config_id=? AND NOT EXISTS (
+        SELECT 1 FROM edges e JOIN json_each(CASE WHEN json_type(e.metadata,'$.nativeExpansions')='array'
+          THEN json_extract(e.metadata,'$.nativeExpansions') ELSE json_array(json_extract(e.metadata,'$.native')) END) x
+        WHERE json_extract(x.value,'$.macroId')=? AND (json_extract(x.value,'$.configId')=? OR
+          (json_extract(x.value,'$.configId') IS NULL AND EXISTS
+            (SELECT 1 FROM semantic_edge_configs m WHERE m.edge_id=e.id AND m.config_id=?))))`)
+        .run(evidence.macroId, evidence.configId, evidence.macroId, evidence.configId, evidence.configId);
+    }
+    return removed;
+  }
+
+  /**
    * @brief 将 clangd 入向调用及配置归属对账到普通 C/C++ 调用边。
    * @param[in] collection 已完成节点修复的视图事实和运行时覆盖状态
    * @param[out] onRepositioned 可选统计回调，仅报告由同一调用关系新坐标替代的旧边数
@@ -562,11 +623,12 @@ export class QueryBuilder {
 
     const nodesByFile = new Map<string, Map<string, Node[]>>();
     /**
-     * @brief 按文件、名称和定义源码范围唯一匹配已修复的图节点。
+     * @brief 按源码范围匹配节点，并用已验证的 canonical USR 区分外部同范围身份。
      * @param[in] identity clangd 函数身份
+     * @param[in] native 可选同 TU 直接绑定的 canonical 身份
      * @return 唯一候选节点；无法消歧时返回 undefined
      */
-    const match = (identity: SemanticSymbolIdentity): Node | undefined => {
+    const match = (identity: SemanticSymbolIdentity, native?: NativeTargetEvidence): Node | undefined => {
       let nodes = nodesByFile.get(identity.filePath);
       if (!nodes) {
         nodes = new Map();
@@ -580,7 +642,9 @@ export class QueryBuilder {
         nodesByFile.set(identity.filePath, nodes);
       }
       const matches = (nodes.get(`${identity.kind}\0${identity.name}`) ?? [])
-        .filter(node => semanticRangesOverlap(node, identity));
+        .filter(node => semanticRangesOverlap(node, identity) && (!identity.external ||
+          !!native?.usr && (safeJsonParse(this.getMetadata(`cpp_native:${node.id}`) ?? '{}', {}) as
+            { usr?: string }).usr === native.usr));
       // 同行 static 或桥接范围不能猜测其 ID；只有唯一源码身份可对账。
       return matches.length === 1 ? matches[0] : undefined;
     };
@@ -589,7 +653,7 @@ export class QueryBuilder {
     const representedTargets = new Set<string>();
     const targetNodes = new Map<string, Node>();
     for (const symbol of collection.symbols) {
-      const node = match(symbol);
+      const node = match(symbol, symbol.native);
       if (node && viewIds.has(symbol.configId)) {
         represented.add(`${symbol.configId}\0${node.id}`);
         representedSources.add(node.id);
@@ -604,7 +668,7 @@ export class QueryBuilder {
     const eligibleTargets = new Map<string, Set<Node>>();
     for (const call of collection.calls) {
       const source = match(call.caller);
-      const target = match(call.callee);
+      const target = match(call.callee, call.native);
       if (!source || !target || !represented.has(`${call.configId}\0${target.id}`)) continue;
       const macro = call.native?.macroId ? this.getNodeById(call.native.macroId) : null;
       if (macro?.kind === 'constant' && macro.semanticOrigin === 'source-structure' &&
@@ -619,9 +683,10 @@ export class QueryBuilder {
       }
       entry.configs.add(call.configId);
       entry.native ??= call.native;
-      if (call.native && !entry.expansions.some(evidence => evidence.spellingFile === call.native!.spellingFile &&
+      if (call.native && !entry.expansions.some(evidence => evidence.configId === call.configId &&
+          evidence.spellingFile === call.native!.spellingFile &&
           evidence.spellingLine === call.native!.spellingLine && evidence.spellingColumn === call.native!.spellingColumn &&
-          evidence.contextHash === call.native!.contextHash)) entry.expansions.push(call.native);
+          evidence.contextHash === call.native!.contextHash)) entry.expansions.push({ ...call.native, configId: call.configId });
       if (represented.has(`${call.configId}\0${source.id}`)) {
         let names = eligibleNames.get(source.id);
         if (!names) { names = new Set(); eligibleNames.set(source.id, names); }
@@ -671,41 +736,56 @@ export class QueryBuilder {
     let repositioned = 0;
     const observedRelations = new Set([...observed.values()].map(entry => `${entry.source.id}\0${entry.target.id}`));
     this.db.transaction(() => {
-      const select = this.db.prepare('SELECT id,provenance FROM edges WHERE source = ? AND target = ? AND kind = ? AND line = ? AND col = ?');
+      const select = this.db.prepare('SELECT id,provenance,metadata FROM edges WHERE source = ? AND target = ? AND kind = ? AND line = ? AND col = ?');
       const insert = this.db.prepare("INSERT OR IGNORE INTO edges (source,target,kind,line,col,provenance,metadata) VALUES (?,?,'calls',?,?,?,?)");
       const member = this.db.prepare('INSERT OR IGNORE INTO semantic_edge_configs (edge_id,config_id) VALUES (?,?)');
       const retireMember = this.db.prepare('DELETE FROM semantic_edge_configs WHERE edge_id = ? AND config_id = ?');
-      // 结构声明自身不声称生效；只有真实展开的正向物理绑定才添加既有配置归属。
-      for (const { node, configId } of observedMacros) this.db.prepare(`INSERT OR IGNORE INTO semantic_node_configs
-        (node_id,config_id,signature,definition_line,definition_col) VALUES (?,?,?,?,?)`)
-        .run(node.id, configId, node.signature ?? null, node.startLine, node.startColumn);
       // Native exporter 覆盖的是 caller TU 的展开调用；旧 external target 不需要自身成为项目 TU。
       // 仅完整权威 caller 允许撤销本轮视图 membership，partial/advisory 保持旧正向证据。
       for (const view of collection.views) {
         if (!view.success || view.inventory !== 'authoritative' || collection.inventory !== 'authoritative') continue;
         for (const file of view.coveredFiles) {
-          if (!nativeCovered(file) || (collection.scopeFiles && !collection.scopeFiles.includes(file))) continue;
-          this.db.prepare(`DELETE FROM semantic_edge_configs WHERE config_id = ? AND edge_id IN (
-            SELECT e.id FROM edges e JOIN nodes s ON s.id=e.source
-            WHERE e.provenance='libclang' AND s.file_path=? AND
-              (json_extract(e.metadata,'$.native.macroId') IN (SELECT value FROM json_each(?)) OR ?))`)
-            .run(view.id, file, JSON.stringify(view.native?.macroIds ?? []), view.native?.structuralComplete ? 1 : 0);
+          if (!view.native?.coveredFiles.includes(file) || view.native.failedFiles.includes(file) ||
+              view.failedFiles.length || view.failedTuCount || view.coveredFiles.length !== view.analyzedTuCount ||
+              (collection.scopeFiles && !collection.scopeFiles.includes(file))) continue;
+          for (const edge of this.db.prepare(`SELECT e.id,e.metadata,e.source,e.target,e.line,e.col FROM edges e JOIN nodes s ON s.id=e.source
+            WHERE s.file_path=? AND e.metadata IS NOT NULL AND json_extract(e.metadata,'$.native') IS NOT NULL`)
+            .all(file) as Array<{ id: number; metadata: string; source: string; target: string; line: number; col: number }>) {
+            const saved = safeJsonParse(edge.metadata, {}) as { native?: NativeTargetEvidence;
+              nativeExpansions?: NativeTargetEvidence[] };
+            const expansions = saved.nativeExpansions ?? (saved.native ? [saved.native] : []);
+            const retained = expansions.filter(evidence => !(evidence.configId === view.id &&
+              evidence.translationUnit === file && (view.native!.structuralComplete ||
+                !!evidence.macroId && view.native!.macroIds.includes(evidence.macroId))));
+            if (retained.length !== expansions.length) {
+              // 同一真实关系的新快照原位替换旧证据，避免删除后重建导致边 ID 自漂移。
+              retained.push(...(observed.get(JSON.stringify([edge.source, edge.target, edge.line, edge.col]))?.expansions ?? [])
+                .filter(evidence => evidence.configId === view.id && evidence.translationUnit === file));
+              result.removed += this.reconcileCppNativeExpansions(edge.id, retained);
+            }
+          }
         }
       }
       // 精确坐标是边身份：同一调用者/目标的不同调用点必须逐条保留。
       for (const entry of observed.values()) {
         let row = select.get(entry.source.id, entry.target.id, 'calls', entry.line, entry.col) as
-          { id: number; provenance: string | null } | undefined;
+          { id: number; provenance: string | null; metadata: string | null } | undefined;
         if (!row) {
           result.added += insert.run(entry.source.id, entry.target.id, entry.line, entry.col, entry.provenance,
-            entry.native ? JSON.stringify({ native: entry.native, nativeExpansions: entry.expansions }) : null).changes;
+            entry.native ? JSON.stringify({ native: entry.expansions[0], nativeExpansions: entry.expansions }) : null).changes;
           row = select.get(entry.source.id, entry.target.id, 'calls', entry.line, entry.col) as typeof row;
+        }
+        if (row && entry.native) {
+          const saved = safeJsonParse(row.metadata ?? '{}', {}) as { native?: NativeTargetEvidence;
+            nativeExpansions?: NativeTargetEvidence[] };
+          const expansions = saved.nativeExpansions ?? (saved.native ? [saved.native] : []);
+          const combined = [...expansions];
+          for (const evidence of entry.expansions) if (!combined.some(old =>
+            JSON.stringify(old) === JSON.stringify(evidence))) combined.push(evidence);
+          this.reconcileCppNativeExpansions(row.id, combined);
         }
         // 唯一索引可能已被 heuristic 占用；绝不改写其归属或删除它。
         if (row && row.provenance !== 'heuristic') {
-          if (row.provenance === 'libclang' && entry.native && fullyObservedRelation(entry.source, entry.target, true))
-            this.db.prepare('UPDATE edges SET metadata=? WHERE id=?')
-              .run(JSON.stringify({ native: entry.native, nativeExpansions: entry.expansions }), row.id);
           if (fullyObservedRelation(entry.source, entry.target, row.provenance === 'libclang')) {
             // 完整覆盖方可撤销已验证边在旧视图里的归属；部分结果只附加正向事实。
             for (const view of collection.views) {
@@ -718,10 +798,15 @@ export class QueryBuilder {
           for (const config of entry.configs) member.run(row.id, config);
         }
       }
+      // 先完成旧 scope 退役，再附加本轮真实展开，避免目标切换时旧边清理撤销新宏归属。
+      // 结构声明本身不声称生效；partial/advisory 仍接受这些正向物理绑定。
+      for (const { node, configId } of observedMacros) this.db.prepare(`INSERT OR IGNORE INTO semantic_node_configs
+        (node_id,config_id,signature,definition_line,definition_col) VALUES (?,?,?,?,?)`)
+        .run(node.id, configId, node.signature ?? null, node.startLine, node.startColumn);
       const stale = this.db.prepare(`
         SELECT e.id,e.target,e.line,e.col,t.name FROM edges e
         JOIN nodes t ON t.id = e.target WHERE e.source = ? AND e.kind = 'calls'
-          AND (e.provenance IS NULL OR e.provenance != 'heuristic')
+          AND (e.provenance IS NULL OR e.provenance NOT IN ('heuristic','libclang'))
       `);
       const remove = this.db.prepare('DELETE FROM edges WHERE id = ?');
       // 从已有目标反查可能需要删除的调用者；不逐个扫描无调用的所有函数。
@@ -735,8 +820,6 @@ export class QueryBuilder {
         const source = this.getNodeById(sourceId);
         if (!source || !covered(source.filePath)) continue;
         for (const edge of stale.all(sourceId) as Array<{ id: number; target: string; line: number | null; col: number | null; name: string }>) {
-          // Native 边只由其完整工作清单/输入失效路径退役，不用 ordinary clangd 的缺失事实删除。
-          if ((this.db.prepare('SELECT provenance FROM edges WHERE id=?').get(edge.id) as { provenance?: string })?.provenance === 'libclang') continue;
           if (collection.scopeFiles && !collection.scopeFiles.includes(source.filePath) &&
               !collection.scopeFiles.includes(this.getNodeById(edge.target)?.filePath ?? '')) continue;
           // 缺失事实只能否定已纳入语义清单的目标；错误 static 目标需有同名正向证据。
@@ -1922,7 +2005,8 @@ export class QueryBuilder {
           sql += ` AND nodes.language IN (${languages.map(() => '?').join(',')})`;
           params.push(...languages);
         }
-        sql += ' ORDER BY length(nodes.name), nodes.name LIMIT ?';
+        // 决胜键必须先于预算截断，同名同分候选不能由数据库写入顺序选择。
+        sql += ' ORDER BY length(nodes.name), nodes.name, nodes.file_path, nodes.start_line, nodes.start_column, nodes.id LIMIT ?';
         const rows = this.db.prepare(sql).all(...params, Math.max(limit * 5, 100)) as NodeRow[];
         for (const row of rows) {
           if (!existingIds.has(row.id)) {
@@ -1958,11 +2042,12 @@ export class QueryBuilder {
               splitIdentifierSegments(r.node.name).includes(component) ? 25 : 0),
         };
       });
+      // SQLite 的 LIMIT 前使用 UTF-8 binary 决胜，终局必须同序；不能依赖主机 locale。
       results.sort((a, b) => b.score - a.score || (options.intent !== 'prose' ?
-        a.node.filePath.localeCompare(b.node.filePath) ||
+        Buffer.compare(Buffer.from(a.node.filePath), Buffer.from(b.node.filePath)) ||
         a.node.startLine - b.node.startLine ||
         a.node.startColumn - b.node.startColumn ||
-        a.node.id.localeCompare(b.node.id) : 0));
+        Buffer.compare(Buffer.from(a.node.id), Buffer.from(b.node.id)) : 0));
       // Trim to requested limit after rescoring
       if (results.length > limit) {
         results = results.slice(0, limit);

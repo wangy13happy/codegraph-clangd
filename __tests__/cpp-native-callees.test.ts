@@ -140,6 +140,41 @@ describe('same-session native macro targets', () => {
     } finally { graph.destroy(); process.env = saved; }
   }, 30_000);
 
+  it.skipIf(!runtimeAvailable)('keeps two canonical USRs at one external physical declaration across actual compile views', async () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-native-usr-')); temporary.push(parent);
+    const root = path.join(parent, 'project'); fs.mkdirSync(root);
+    const external = path.join(parent, 'sdk.h');
+    fs.writeFileSync(external, '#if WIDE\ntypedef long number;\n#else\ntypedef int number;\n#endif\nextern void sink(number);\n');
+    fs.writeFileSync(path.join(root, 'macros.h'), `#include "${external}"\n#define CALL(x) sink(x)\n`);
+    const source = path.join(root, 'caller.cpp');
+    fs.writeFileSync(source, '#include "macros.h"\nvoid caller() { CALL(1); }\n');
+    fs.writeFileSync(path.join(root, 'codegraph.json'), JSON.stringify({ cppSemanticRepair: { enabled: true } }));
+    fs.writeFileSync(path.join(root, 'compile_commands.json'), JSON.stringify([0, 1].map(wide => ({
+      directory: root, file: source, output: `build/CMakeFiles/app${wide}.dir/caller.cpp.o`,
+      arguments: ['/usr/bin/cc', `-DWIDE=${wide}`, '-c', source],
+    }))));
+    const saved = { ...process.env }; process.env.CODEGRAPH_CLANGD_PATH = '/usr/bin/clangd-19';
+    delete process.env.CODEGRAPH_COMPILE_COMMANDS; delete process.env.CODEGRAPH_CLANGD_QUERY_DRIVERS;
+    const graph = await CodeGraph.init(root, { silent: true });
+    try {
+      await graph.indexAll();
+      expect(graph.getCppSemanticRepairStatus()).toMatchObject({ state: 'complete', viewsFailed: 0,
+        native: { attemptedTus: 2, failedTus: 0 } });
+      const caller = graph.searchNodes('caller', { kinds: ['function'] })[0]!.node;
+      const calls = graph.getCallees(caller.id).filter(item => item.edge.provenance === 'libclang');
+      expect(calls).toHaveLength(2);
+      expect(calls.map(item => item.edge.metadata?.native).map(evidence => (evidence as { usr: string }).usr).sort())
+        .toEqual(['c:@F@sink#I#', 'c:@F@sink#L#']);
+      expect(calls.every(item => item.node.filePath === external && item.node.startLine === 6)).toBe(true);
+      expect(graph.searchNodes('sink', { kinds: ['function'] }).filter(item => item.node.filePath === external))
+        .toHaveLength(2);
+      const identities = calls.map(item => item.node.id).sort();
+      await graph.sync();
+      expect(graph.getCallees(caller.id).filter(item => item.edge.provenance === 'libclang')
+        .map(item => item.node.id).sort()).toEqual(identities);
+    } finally { graph.destroy(); process.env = saved; }
+  }, 30_000);
+
   it.skipIf(!runtimeAvailable)('marks unsupported Paren, scratch and nested macro identities partial without guessing targets', async () => {
     const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-native-unknown-')); temporary.push(parent);
     const root = path.join(parent, 'project'); fs.mkdirSync(root);

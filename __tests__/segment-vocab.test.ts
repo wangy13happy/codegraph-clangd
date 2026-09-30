@@ -4,6 +4,8 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { CodeGraph } from '../src';
 import { extractProseCandidates } from '../src/search/identifier-segments';
+import { DatabaseConnection } from '../src/db';
+import { QueryBuilder } from '../src/db/queries';
 
 /**
  * The graph-derived gate behind the prompt hook's MEDIUM tier: symbol names
@@ -160,6 +162,39 @@ export function validate_file_md5(): boolean { return true; }
     await cg.sync();
     expect(cg.searchNodes('SHA256').map(result => result.node.name))
       .not.toContain('CheckArchiveFileSHA256');
+  });
+
+  it('selects stable component candidates before truncating more than one hundred equal names', () => {
+    for (const reverse of [false, true]) {
+      const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'segment-budget-'));
+      const connection = DatabaseConnection.initialize(path.join(sandbox, 'graph.db'));
+      try {
+        const queries = new QueryBuilder(connection.getDb());
+        const indices = Array.from({ length: 150 }, (_unused, index) => index);
+        for (const index of reverse ? indices.reverse() : indices) queries.insertNode({
+          id: `candidate-${index}`, name: 'VerifyArchiveMD5', qualifiedName: 'VerifyArchiveMD5',
+          filePath: `f${String(index).padStart(3, '0')}.ts`, kind: 'function', language: 'typescript',
+          startLine: 1, endLine: 2, startColumn: 0, endColumn: 1, updatedAt: 1,
+        });
+        for (const limit of [1, 5, 25]) {
+          const results = queries.searchNodes('MD5', { limit });
+          expect(results.map(result => result.node.filePath)).toEqual(Array.from({ length: limit },
+            (_unused, index) => `f${String(index).padStart(3, '0')}.ts`));
+          expect(new Set(results.map(result => result.score)).size).toBe(1);
+        }
+        // 自然语言路由不得因符号分段召回改变原候选集合。
+        expect(queries.searchNodes('MD5', { intent: 'prose', limit: 5 })[0]!.score)
+          .toBeCloseTo(queries.searchNodes('MD5', { limit: 5 })[0]!.score - 25);
+        const mixedPaths = Array.from({ length: 150 }, (_unused, index) =>
+          `${['A', 'a', 'é'][index % 3]}${String(index).padStart(3, '0')}.ts`);
+        for (const index of indices) queries.updateNode({ ...queries.getNodeById(`candidate-${index}`)!, filePath: mixedPaths[index]! });
+        expect(queries.searchNodes('MD5', { limit: 5 }).map(result => result.node.filePath))
+          .toEqual(mixedPaths.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b))).slice(0, 5));
+      } finally {
+        connection.close();
+        fs.rmSync(sandbox, { recursive: true, force: true });
+      }
+    }
   });
 
   it('unrelated prose matches nothing', () => {

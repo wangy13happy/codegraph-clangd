@@ -67,7 +67,7 @@ export interface CppSemanticInputs {
   error?: string;
 }
 
-const REPAIR_ALGORITHM_VERSION = 5;
+const REPAIR_ALGORITHM_VERSION = 6;
 
 /**
  * @brief 将同一静态输入快照与已观察的 selective 声明字节身份组成修复指纹。

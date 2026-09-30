@@ -507,7 +507,7 @@ export class CodeGraph {
       const macroScan = { nodes: [] as Node[], complete: true, scannedNodes: 0, sourceBytes: 0, reasons: [] as string[] };
       const macrosStarted = Date.now();
       const macrosAdded = await reconcileCppStructuralMacros(this.projectRoot, this.db.getDb(), this.queries,
-        inputs.database.entries.map(entry => entry.file), false, macroScan, inputs.database.includeDirectories);
+        inputs.database.entries.map(entry => entry.file), macroScan, inputs.database.includeDirectories);
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(
         `[semantic-timing] structural-macros: ${Date.now() - macrosStarted}ms added=${macrosAdded} candidates=${macroScan.nodes.length} complete=${macroScan.complete} nodes=${macroScan.scannedNodes} bytes=${macroScan.sourceBytes} reasons=${JSON.stringify(macroScan.reasons)}`);
       const collectionStarted = Date.now();

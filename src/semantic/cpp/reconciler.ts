@@ -10,7 +10,7 @@ import { generateNodeId, semanticCollisionNodeId } from '../../extraction/tree-s
 import { Node } from '../../types';
 import { isWithinProject } from './compile-database';
 import { SemanticFactCollection } from './index';
-import { SemanticSymbolFact, semanticRangesOverlap, assertPairwiseSemanticOverlap,
+import { NativeTargetEvidence, SemanticSymbolFact, semanticRangesOverlap, assertPairwiseSemanticOverlap,
   StructuralTypedefContext } from './facts';
 import { nativeDeclarationHash } from './native-callees';
 
@@ -19,32 +19,43 @@ import { nativeDeclarationHash } from './native-callees';
  * @param[in] db 既有图数据库连接
  * @param[in] queries 节点与元数据接口
  * @param[in] root 项目真实根目录，用于核验 native 自有主文件输入
+ * @param[in] changedMacroIds 已证明物理定义范围改变的结构宏 ID；不来自缺失采集
  * @return 无；不可读属于 unknown 并保留历史证据，不作为 absence 删除条件
  */
-export function invalidateCppNativeDeclarations(db: SqliteDatabase, queries: QueryBuilder, root: string): void {
+export function invalidateCppNativeDeclarations(db: SqliteDatabase, queries: QueryBuilder, root: string,
+  changedMacroIds: ReadonlySet<string> = new Set()): void {
   db.transaction(() => {
     const invalidatedTargets = new Set<string>();
-    for (const edge of db.prepare("SELECT id,target,metadata FROM edges WHERE provenance='libclang'")
+    for (const edge of db.prepare(`SELECT id,target,metadata FROM edges WHERE provenance='libclang' OR
+      (metadata IS NOT NULL AND json_extract(metadata,'$.native') IS NOT NULL)`)
       .all() as Array<{ id: number; target: string; metadata: string | null }>) {
-      let evidence: { translationUnit?: string; sourceHash?: string; spellingFile?: string; macroHash?: string;
-        declarationFile?: string; declarationHash?: string };
-      try { evidence = JSON.parse(edge.metadata ?? '{}').native ?? {}; } catch { continue; }
-      const inputs: Array<[string, string | undefined]> = [];
-      if (evidence.translationUnit && !path.isAbsolute(evidence.translationUnit) &&
-          !evidence.translationUnit.split(/[\\/]/).includes('..'))
-        inputs.push([path.join(root, evidence.translationUnit), evidence.sourceHash]);
-      if (evidence.spellingFile && path.isAbsolute(evidence.spellingFile))
-        inputs.push([evidence.spellingFile, evidence.macroHash]);
-      if (evidence.declarationFile && path.isAbsolute(evidence.declarationFile))
-        inputs.push([evidence.declarationFile, evidence.declarationHash]);
-      // 输入字节变化/物理文件删除是正面失效事实，和失败分析所产生的缺失事实不同。
-      // 仅清 native 自有边；普通 baseline/heuristic 关系和 unknown 的权限错误仍保留。
-      const invalid = inputs.some(([file, hash]) => {
-        if (!hash) return false;
-        try { return nativeDeclarationHash(file) !== hash; }
-        catch (failure) { return ['ENOENT', 'ENOTDIR'].includes((failure as NodeJS.ErrnoException).code ?? ''); }
+      let expansions: NativeTargetEvidence[];
+      try {
+        const metadata = JSON.parse(edge.metadata ?? '{}');
+        expansions = metadata.nativeExpansions ?? (metadata.native ? [metadata.native] : []);
+      } catch { continue; }
+      if (!expansions.length) continue;
+      const retained = expansions.filter(evidence => {
+        if (evidence.macroId && changedMacroIds.has(evidence.macroId)) return false;
+        const inputs: Array<[string, string | undefined]> = [];
+        if (evidence.translationUnit && !path.isAbsolute(evidence.translationUnit) &&
+            !evidence.translationUnit.split(/[\\/]/).includes('..'))
+          inputs.push([path.join(root, evidence.translationUnit), evidence.sourceHash]);
+        if (evidence.spellingFile && path.isAbsolute(evidence.spellingFile))
+          inputs.push([evidence.spellingFile, evidence.macroHash]);
+        if (evidence.declarationFile && path.isAbsolute(evidence.declarationFile))
+          inputs.push([evidence.declarationFile, evidence.declarationHash]);
+        // 变化/物理删除否定这一份展开，不能连带否定另一视图未变化的物理输入。
+        // 普通边只失去 native 证据，不失去自身关系；权限/预算等 unknown 保留。
+        return !inputs.some(([file, hash]) => {
+          if (!hash) return false;
+          try { return nativeDeclarationHash(file) !== hash; }
+          catch (failure) { return ['ENOENT', 'ENOTDIR'].includes((failure as NodeJS.ErrnoException).code ?? ''); }
+        });
       });
-      if (invalid) { db.prepare('DELETE FROM edges WHERE id=?').run(edge.id); invalidatedTargets.add(edge.target); }
+      // 同时迁移旧证据的 context→config 映射，必须在新采集覆盖旧视图 metadata 之前完成。
+      queries.reconcileCppNativeExpansions(edge.id, retained);
+      if (retained.length !== expansions.length) invalidatedTargets.add(edge.target);
     }
     for (const node of queries.getNodesByKind('function').concat(queries.getNodesByKind('method'))) {
       if (node.semanticOrigin !== 'libclang') continue;
@@ -58,6 +69,9 @@ export function invalidateCppNativeDeclarations(db: SqliteDatabase, queries: Que
         invalid = code === 'ENOENT' || code === 'ENOTDIR';
       }
       if (!invalid) {
+        if (invalidatedTargets.has(node.id)) db.prepare(`DELETE FROM semantic_node_configs WHERE node_id=? AND
+          config_id NOT IN (SELECT m.config_id FROM semantic_edge_configs m JOIN edges e ON e.id=m.edge_id WHERE e.target=?)`)
+          .run(node.id, node.id);
         // 输入失效已明确删除最后一条自有引用时，可以清理孤立 stub；不借其他 view 的 absence。
         if (invalidatedTargets.has(node.id) &&
             !db.prepare('SELECT 1 FROM edges WHERE source=? OR target=? LIMIT 1').get(node.id, node.id)) {
@@ -206,13 +220,12 @@ export function reconcileCppTypedefBindings(db: SqliteDatabase, queries: QueryBu
  * @param[in] db 当前语义修复事务使用的数据库连接
  * @param[in] queries 当前图节点读写接口
  * @param[in] translationUnits 编译数据库中的项目相对 TU 路径；不会扫描依赖 TU 或递归 include
- * @param[in] allowRetirement 权威采集完整时允许退役不再有结构候选的旧宏
  * @param[out] candidateResult 可选输出，本轮实际候选及结构扫描是否在预算内完整
  * @param[in] includeDirectories 共享 CDB 解析的项目内 include 目录，仅分类失败，不猜测生效顺序
  * @return 本轮新建的宏定义节点数量；缺失语法或文件时跳过相应文件
  */
 export async function reconcileCppStructuralMacros(root: string, db: SqliteDatabase,
-  queries: QueryBuilder, translationUnits: string[], allowRetirement = false,
+  queries: QueryBuilder, translationUnits: string[],
   candidateResult?: { nodes: Node[]; complete: boolean; scannedNodes?: number; sourceBytes?: number; reasons?: string[] },
   includeDirectories: string[] = []): Promise<number> {
   // 普通提取运行在解析 worker；主线程需为此 opt-in 阶段单独加载 C 语法。
@@ -292,7 +305,7 @@ export async function reconcileCppStructuralMacros(root: string, db: SqliteDatab
       referenced.set(header, used);
     }
   }
-  const retained = new Set<string>();
+  const changedMacroIds = new Set<string>();
   for (const file of queries.getAllFiles()) {
     const usedNames = referenced.get(file.path);
     if (!usedNames || (file.language !== 'c' && file.language !== 'cpp') || !/\.(?:h|hh|hpp|hxx)$/i.test(file.path)) continue;
@@ -316,7 +329,7 @@ export async function reconcileCppStructuralMacros(root: string, db: SqliteDatab
       if (!oldHash || oldHash === currentHash) continue;
       // 此物理范围的已保存定义字节确实改变，独立于其他 TU/include 的 partial。
       // 不利用“没采到”删除，且只退役结构宏自身及其 native 自有展开边。
-      db.prepare("DELETE FROM edges WHERE provenance='libclang' AND json_extract(metadata,'$.native.macroId')=?").run(node.id);
+      changedMacroIds.add(node.id);
       queries.deleteNode(node.id); db.prepare('DELETE FROM project_metadata WHERE key=?').run(`cpp_macro:${node.id}`);
       existing.delete(node.id);
     }
@@ -336,7 +349,6 @@ export async function reconcileCppStructuralMacros(root: string, db: SqliteDatab
           const name = identifier.text;
           const startLine = syntax.startPosition.row + 1;
           const id = generateNodeId(file.path, 'constant', name, startLine);
-          retained.add(id);
           if (!existing.has(id) || existing.get(id)?.semanticOrigin === 'source-structure') {
             // Tree-sitter 的结束位置为半开区间；行首结束不能包含下一行源码。
             const endLine = syntax.endPosition.row + (syntax.endPosition.column === 0 ? 0 : 1);
@@ -361,13 +373,7 @@ export async function reconcileCppStructuralMacros(root: string, db: SqliteDatab
     db.transaction(() => visit(tree.rootNode))();
     tree.delete();
   }
-  if (complete && allowRetirement) {
-    // 结构退役只作用于本路径创建的宏；任何 TU/头文件读取失败时保留旧正向事实。
-    for (const row of db.prepare("SELECT id FROM nodes WHERE semantic_origin = 'source-structure' AND kind = 'constant'")
-      .all() as Array<{ id: string }>) {
-      if (!retained.has(row.id)) queries.deleteNode(row.id);
-    }
-  }
+  if (changedMacroIds.size) invalidateCppNativeDeclarations(db, queries, root, changedMacroIds);
   db.prepare(`DELETE FROM project_metadata WHERE substr(key,1,10)='cpp_macro:' AND
     NOT EXISTS (SELECT 1 FROM nodes WHERE id=substr(project_metadata.key,11))`).run();
   if (candidateResult) {
@@ -474,11 +480,21 @@ export function reconcileCppSemanticNodes(db: SqliteDatabase, queries: QueryBuil
       // 若当前仅有 advisory 或视图未完整覆盖，则完全不能根据缺失清理旧配置。
       for (const row of db.prepare('SELECT id FROM semantic_configs').all() as Array<{ id: string }>) {
         if (!ids.has(row.id)) {
-          const nativeEdges = db.prepare(`SELECT e.id FROM edges e JOIN semantic_edge_configs m ON m.edge_id=e.id
-            WHERE e.provenance='libclang' AND m.config_id=?`).all(row.id) as Array<{ id: number }>;
+          const nativeEdges = db.prepare(`SELECT e.id,e.metadata FROM edges e WHERE
+            (e.provenance='libclang' OR json_extract(e.metadata,'$.native') IS NOT NULL) AND
+            (EXISTS (SELECT 1 FROM semantic_edge_configs m WHERE m.edge_id=e.id AND m.config_id=?) OR
+             EXISTS (SELECT 1 FROM json_each(e.metadata,'$.nativeExpansions') x WHERE json_extract(x.value,'$.configId')=?))`)
+            .all(row.id, row.id) as Array<{ id: number; metadata: string | null }>;
+          for (const edge of nativeEdges) {
+            let expansions: NativeTargetEvidence[];
+            try { expansions = JSON.parse(edge.metadata ?? '{}').nativeExpansions ?? []; } catch { continue; }
+            // 全集中的配置已明确退役，其物理证据也不能继续充当其他视图的独立支持。
+            if (expansions.some(evidence => evidence.configId === row.id))
+              queries.reconcileCppNativeExpansions(edge.id, expansions.filter(evidence => evidence.configId !== row.id));
+          }
           db.prepare('DELETE FROM semantic_configs WHERE id = ?').run(row.id);
           // 配置全集的正面退役独立于新配置 native 局部失败；不能全局清所有无归属边。
-          for (const edge of nativeEdges) db.prepare(`DELETE FROM edges WHERE id=? AND
+          for (const edge of nativeEdges) db.prepare(`DELETE FROM edges WHERE id=? AND provenance='libclang' AND
             NOT EXISTS (SELECT 1 FROM semantic_edge_configs WHERE edge_id=edges.id)`).run(edge.id);
         }
       }

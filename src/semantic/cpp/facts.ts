@@ -21,6 +21,8 @@ export interface SemanticSymbolIdentity {
 }
 
 export interface NativeTargetEvidence {
+  /** 持久化展开所属的真实编译视图；旧记录由同会话 contextHash 恢复，不猜测配置。 */
+  configId?: string;
   usr: string;
   linkage: number;
   translationUnit: string;
