@@ -51,6 +51,11 @@ export function resolveDeferredThisMemberRefs(): void {}
 export function writeConfig(): void {}
 `;
     fs.writeFileSync(path.join(dir, 'src', 'noise.ts'), noise + fpBait + '\n');
+    fs.writeFileSync(path.join(dir, 'src', 'md5.ts'), `
+export class MD5_CTX {}
+export function CheckArchiveFileMD5(): boolean { return true; }
+export function validate_file_md5(): boolean { return true; }
+`);
 
     cg = await CodeGraph.init(dir, { silent: true });
     await cg.indexAll();
@@ -97,6 +102,59 @@ export function writeConfig(): void {}
     queries.insertNameSegmentsBatch(['GhostSymbolMachine']);
     const matches = cg.getSegmentMatches(['ghost', 'symbol']);
     expect(matches).toEqual([]);
+  });
+
+  it('search recalls existing compound-name components and keeps filters and stale rows honest', () => {
+    const queries = (cg as unknown as { queries: { insertNameSegmentsBatch(names: string[]): void } }).queries;
+    queries.insertNameSegmentsBatch(['GhostArchiveMD5']);
+    const matches = cg.searchNodes('MD5', { limit: 10 });
+    expect(matches[0]?.node.name).toBe('CheckArchiveFileMD5');
+    expect(matches.map(result => result.node.name)).toContain('validate_file_md5');
+    expect(matches.some(result => result.node.name === 'GhostArchiveMD5')).toBe(false);
+    expect(cg.searchNodes('kind:function MD5').map(result => result.node.name))
+      .toContain('CheckArchiveFileMD5');
+    expect(cg.searchNodes('lang:c MD5')).toEqual([]);
+    expect(cg.searchNodes('unrelated-identifier').map(result => result.node.name))
+      .not.toContain('CheckArchiveFileMD5');
+  });
+
+  it('ranks exact names first and breaks equal-score component ties independently of insertion order', async () => {
+    fs.appendFileSync(path.join(dir, 'src', 'md5.ts'), '\nexport function MD5(): boolean { return true; }\n');
+    await cg.sync();
+    expect(cg.searchNodes('MD5', { limit: 10 })[0]?.node.name).toBe('MD5');
+
+    const orders = [['z.ts', 'a.ts'], ['a.ts', 'z.ts']];
+    for (const order of orders) {
+      const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'segment-order-'));
+      let graph: CodeGraph | undefined;
+      try {
+        for (const file of order) {
+          fs.writeFileSync(path.join(sandbox, file), 'export function VerifyArchiveMD5(): boolean { return true; }\n');
+        }
+        graph = await CodeGraph.init(sandbox, { silent: true });
+        await graph.indexAll();
+        const paths = graph.searchNodes('MD5', { limit: 10 }).map(result => result.node.filePath);
+        expect(paths).toEqual(['a.ts', 'z.ts']);
+        expect(graph.searchNodes('MD5', { limit: 10 }).map(result => result.node.filePath)).toEqual(paths);
+      } finally {
+        graph?.destroy();
+        fs.rmSync(sandbox, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('incremental rename and removal retire old component candidates', async () => {
+    const file = path.join(dir, 'src', 'md5.ts');
+    fs.writeFileSync(file, 'export function CheckArchiveFileSHA256(): boolean { return true; }\n');
+    await cg.sync();
+    expect(cg.searchNodes('MD5').map(result => result.node.name))
+      .not.toContain('CheckArchiveFileMD5');
+    expect(cg.searchNodes('SHA256').map(result => result.node.name))
+      .toContain('CheckArchiveFileSHA256');
+    fs.unlinkSync(file);
+    await cg.sync();
+    expect(cg.searchNodes('SHA256').map(result => result.node.name))
+      .not.toContain('CheckArchiveFileSHA256');
   });
 
   it('unrelated prose matches nothing', () => {

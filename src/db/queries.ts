@@ -1818,9 +1818,10 @@ export class QueryBuilder {
     // Lowering the parameter in SQL rather than in JS is deliberate: SQLite's
     // `lower()` and NOCASE both fold ASCII only, while JS `.toLowerCase()`
     // folds Unicode, which would silently stop matching non-ASCII names.
-    if (results.length > 0 && query) {
+    if (query) {
       const existingIds = new Set(results.map(r => r.node.id));
-      const maxFtsScore = Math.max(...results.map(r => r.score));
+      const maxFtsScore = results.length > 0 ? Math.max(...results.map(r => r.score)) : 1;
+      const component = /^[a-z][a-z0-9]{1,31}$/i.test(text) ? text.toLowerCase() : '';
       const terms = query.split(/\s+/).filter(t => t.length >= 2);
       for (const term of terms) {
         let sql = 'SELECT * FROM nodes WHERE lower(name) = lower(?)';
@@ -1842,11 +1843,35 @@ export class QueryBuilder {
           }
         }
       }
+      // FTS treats compound identifiers as a single token. Reuse the indexed
+      // name vocabulary to recall a trailing component without scanning nodes.
+      if (component) {
+        let sql = `SELECT nodes.* FROM name_segment_vocab AS vocab
+          JOIN nodes ON nodes.name = vocab.name WHERE vocab.segment = ?`;
+        const params: (string | number)[] = [component];
+        if (kinds && kinds.length > 0) {
+          sql += ` AND nodes.kind IN (${kinds.map(() => '?').join(',')})`;
+          params.push(...kinds);
+        }
+        if (languages && languages.length > 0) {
+          sql += ` AND nodes.language IN (${languages.map(() => '?').join(',')})`;
+          params.push(...languages);
+        }
+        sql += ' ORDER BY length(nodes.name), nodes.name LIMIT ?';
+        const rows = this.db.prepare(sql).all(...params, Math.max(limit * 5, 100)) as NodeRow[];
+        for (const row of rows) {
+          if (!existingIds.has(row.id)) {
+            results.push({ node: rowToNode(row), score: maxFtsScore });
+            existingIds.add(row.id);
+          }
+        }
+      }
     }
 
     // Apply multi-signal scoring
     if (results.length > 0 && (text || query)) {
       const scoringQuery = text || query;
+      const component = /^[a-z][a-z0-9]{1,31}$/i.test(text) ? text.toLowerCase() : '';
       results = results.map(r => {
         // A path the project de-prioritized is saying its symbol NAMES are not
         // the answer, so the exact-name bonus has to be damped too. The -15 path
@@ -1862,10 +1887,16 @@ export class QueryBuilder {
           score: r.score
             + kindBonus(r.node.kind)
             + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens, deprioritized)
-            + (deprioritized ? Math.round(nameBonus * DEPRIORITIZED_NAME_BONUS_SCALE) : nameBonus),
+            + (deprioritized ? Math.round(nameBonus * DEPRIORITIZED_NAME_BONUS_SCALE) : nameBonus)
+            + (component && !r.node.name.toLowerCase().startsWith(component) &&
+              splitIdentifierSegments(r.node.name).includes(component) ? 25 : 0),
         };
       });
-      results.sort((a, b) => b.score - a.score);
+      results.sort((a, b) => b.score - a.score ||
+        a.node.filePath.localeCompare(b.node.filePath) ||
+        a.node.startLine - b.node.startLine ||
+        a.node.startColumn - b.node.startColumn ||
+        a.node.id.localeCompare(b.node.id));
       // Trim to requested limit after rescoring
       if (results.length > limit) {
         results = results.slice(0, limit);
