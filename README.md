@@ -2,6 +2,10 @@
 
 # CodeGraph
 
+> **Fork branch: `feat/cpp-semantic-repair-v1.6.0`.** This branch extends upstream v1.6.0 with opt-in C/C++ compilation semantics, bounded macro call evidence, selective external symbols, conditional typedef facts, and incremental reconciliation. See the [中文分支说明与源码安装指南](README.cpp-semantic-repair.md).
+>
+> The upstream installers, npm package, and `codegraph upgrade` below do **not** install these fork changes. Use the source installation in the branch guide to retain them.
+
 Already installed? Run `codegraph upgrade`
 
 Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
@@ -49,6 +53,7 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 
 ## Contents
 
+- [Fork branch guide / 中文分支说明](README.cpp-semantic-repair.md)
 - [Get Started](#get-started)
 - [Language Support](#language-support)
 - [Why CodeGraph?](#why-codegraph)
