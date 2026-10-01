@@ -18,10 +18,10 @@
 
 已验证的环境是 Linux x86_64、Node **24.15.0**、clangd **19.1.7**、Python 3 和 libclang **19**。源码依赖 `node:sqlite`，不能使用系统 Node 20；当前 CLI 也拒绝 Node 25 及以上。其他平台未在本分支的这轮验证中验收。
 
-从当前 fork 的 **Code** 菜单复制 clone URL，然后执行；将占位符替换为实际 URL：
+从 `wangy13happy/codegraph` 的语义修复分支安装：
 
 ```bash
-git clone --branch feat/cpp-semantic-repair-v1.6.0 '本fork的clone-URL' codegraph
+git clone --branch feat/cpp-semantic-repair-v1.6.0 https://github.com/wangy13happy/codegraph.git codegraph
 cd codegraph
 node --version
 npm ci --ignore-scripts
