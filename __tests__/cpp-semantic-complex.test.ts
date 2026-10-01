@@ -5,6 +5,9 @@ import * as path from 'path';
 import { CodeGraph } from '../src';
 import { DatabaseConnection } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
+import { loadCompilationDatabase } from '../src/semantic/cpp/compile-database';
+import { buildCompileViews } from '../src/semantic/cpp/compile-views';
+import type { NativeTargetEvidence } from '../src/semantic/cpp/facts';
 
 // 与既有 unknown-I/O 回归一致：普通 FS 全部委托真实实现，只开放一个可定向替换的接口。
 vi.mock('fs', async importOriginal => ({ ...await importOriginal<typeof import('fs')>() }));
@@ -87,11 +90,10 @@ function nativeCalls(graph: CodeGraph, name: string): ReturnType<CodeGraph['getC
  * @param[in] call 真实 graph API 返回的调用结果
  * @return 各个展开支持的真实配置身份和物理声明来源
  */
-function expansions(call: ReturnType<CodeGraph['getCallees']>[number]):
-  Array<{ configId: string; usr: string; declarationFile: string; translationUnit: string }> {
+function expansions(call: ReturnType<CodeGraph['getCallees']>[number]): NativeTargetEvidence[] {
   const evidence = call.edge.metadata?.nativeExpansions;
   expect(Array.isArray(evidence)).toBe(true);
-  return evidence as Array<{ configId: string; usr: string; declarationFile: string; translationUnit: string }>;
+  return evidence as NativeTargetEvidence[];
 }
 
 describe('complex PR6 semantic lifecycle regressions', () => {
@@ -105,6 +107,10 @@ describe('complex PR6 semantic lifecycle regressions', () => {
       file, target: `choice${choice}`, flags: [`-DCHOICE=${choice}`],
     })));
     commands(root, rows);
+    // 从实际 CDB 绑定 target 身份，不能从待验证的 graph 结果反推应当保留的视图。
+    const viewIds = new Map(buildCompileViews(loadCompilationDatabase(root)!)
+      .map(view => [view.key, view.id] as const));
+    expect([...viewIds.keys()].sort()).toEqual(['cmake:choice0', 'cmake:choice1']);
     const graph = await indexed(root);
     expect(graph.getCppSemanticRepairStatus()?.state).toBe('complete');
     const stable = new Map<string, number>();
@@ -114,6 +120,8 @@ describe('complex PR6 semantic lifecycle regressions', () => {
       expect(calls.every(call => call.node.filePath === external)).toBe(true);
       expect(calls.every(call => expansions(call).length === 1)).toBe(true);
       expect(new Set(calls.flatMap(call => expansions(call).map(item => item.configId))).size).toBe(2);
+      for (const call of calls) expect(expansions(call).map(item => [item.configId, item.translationUnit]))
+        .toEqual([[viewIds.get(call.node.name === 'alpha_sink' ? 'cmake:choice1' : 'cmake:choice0'), `${caller}.c`]]);
       stable.set(caller, calls.find(call => call.node.name === 'beta_sink')!.edge.id);
     }
     expect(graph.searchNodes('alpha_sink', { kinds: ['function'] })).toHaveLength(1);
@@ -130,6 +138,8 @@ describe('complex PR6 semantic lifecycle regressions', () => {
       expect(calls[0]!.edge.id).toBe(stable.get(caller));
       expect(expansions(calls[0]!)).toHaveLength(2);
       expect(new Set(expansions(calls[0]!).map(item => item.configId)).size).toBe(2);
+      expect(expansions(calls[0]!).map(item => [item.configId, item.translationUnit]).sort())
+        .toEqual([[viewIds.get('cmake:choice0'), `${caller}.c`], [viewIds.get('cmake:choice1'), `${caller}.c`]].sort());
     }
     commands(root, rows.filter(row => row.target === 'choice0'));
     await graph.sync();
@@ -137,6 +147,8 @@ describe('complex PR6 semantic lifecycle regressions', () => {
       const calls = nativeCalls(graph, caller);
       expect(calls).toHaveLength(1); expect(calls[0]!.edge.id).toBe(stable.get(caller));
       expect(expansions(calls[0]!)).toHaveLength(1);
+      expect(expansions(calls[0]!).map(item => [item.configId, item.translationUnit]))
+        .toEqual([[viewIds.get('cmake:choice0'), `${caller}.c`]]);
     }
   }, 30_000);
 
@@ -173,6 +185,9 @@ describe('complex PR6 semantic lifecycle regressions', () => {
     fs.writeFileSync(path.join(root, 'caller.cpp'), '#include "call.h"\nvoid caller() { SEND(1); }\n');
     const rows = [0, 1].map(wide => ({ file: 'caller.cpp', target: `width${wide}`, flags: [`-DWIDE=${wide}`] }));
     commands(root, rows);
+    const viewIds = new Map(buildCompileViews(loadCompilationDatabase(root)!)
+      .map(view => [view.key, view.id] as const));
+    expect([...viewIds.keys()].sort()).toEqual(['cmake:width0', 'cmake:width1']);
     let graph = await indexed(root);
     expect(graph.getCppSemanticRepairStatus()?.state).toBe('complete');
     const original = nativeCalls(graph, 'caller');
@@ -181,18 +196,38 @@ describe('complex PR6 semantic lifecycle regressions', () => {
     const usrs = original.map(call => expansions(call)[0]!.usr);
     expect(usrs.every(usr => usr.length > 0)).toBe(true); expect(new Set(usrs).size).toBe(2);
     const identities = original.map(call => call.node.id).sort();
+    const expectedSupports = [
+      [viewIds.get('cmake:width0'), 'caller.cpp', 'c:@F@typed_sink#I#'],
+      [viewIds.get('cmake:width1'), 'caller.cpp', 'c:@F@typed_sink#L#'],
+    ].sort();
+    expect(original.every(call => expansions(call).length === 1)).toBe(true);
+    expect(original.flatMap(call => expansions(call).map(item => [item.configId, item.translationUnit, item.usr])).sort())
+      .toEqual(expectedSupports);
+    // 删除前锁定 width0 的 int 身份和边，防止删除后才记录导致错保留或边重建被漏检。
+    const retained = original.find(call => expansions(call)[0]!.configId === viewIds.get('cmake:width0'))!;
+    const retired = original.find(call => expansions(call)[0]!.configId === viewIds.get('cmake:width1'))!;
+    const survivingId = retained.node.id, survivingEdge = retained.edge.id;
+    const { contextHash: originalContext, ...originalSupport } = expansions(retained)[0]!;
+    expect(originalContext).toMatch(/^[a-f0-9]{64}$/);
 
     commands(root, [rows[0]!]); await graph.sync();
     expect(graph.getCppSemanticRepairStatus()?.state).toBe('complete');
     const single = nativeCalls(graph, 'caller');
     expect(single).toHaveLength(1);
-    expect(identities).toContain(single[0]!.node.id);
-    const survivingId = single[0]!.node.id, survivingEdge = single[0]!.edge.id;
+    expect([single[0]!.node.id, single[0]!.edge.id]).toEqual([survivingId, survivingEdge]);
+    expect(expansions(single[0]!)).toHaveLength(1);
+    // 同一支持的会话 contextHash 会随 clangd 临时参数刷新；其余全部物理、USR 和视图证据须不变。
+    const { contextHash, ...currentSupport } = expansions(single[0]!)[0]!;
+    expect(contextHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(currentSupport).toEqual(originalSupport);
+    expect(single.map(call => call.node.id)).not.toContain(retired.node.id);
     expect(graph.searchNodes('typed_sink', { kinds: ['function'] }).map(match => match.node.id)).toEqual([survivingId]);
     commands(root, rows); await graph.sync();
     expect(graph.getCppSemanticRepairStatus()?.state).toBe('complete');
     expect(nativeCalls(graph, 'caller').map(call => call.node.id).sort()).toEqual(identities);
     expect(nativeCalls(graph, 'caller').find(call => call.node.id === survivingId)!.edge.id).toBe(survivingEdge);
+    expect(nativeCalls(graph, 'caller').flatMap(call => expansions(call)
+      .map(item => [item.configId, item.translationUnit, item.usr])).sort()).toEqual(expectedSupports);
 
     // 同一数据库生命周期重建须收敛到同一语义身份集合，而非靠当前插入顺序维持。
     graph.destroy(); graphs.delete(graph); graph = await CodeGraph.recreate(root); graphs.add(graph);
@@ -200,6 +235,8 @@ describe('complex PR6 semantic lifecycle regressions', () => {
     expect(graph.getCppSemanticRepairStatus()?.state).toBe('complete');
     expect(nativeCalls(graph, 'caller').map(call => call.node.id).sort()).toEqual(identities);
     expect(new Set(nativeCalls(graph, 'caller').map(call => expansions(call)[0]!.usr)).size).toBe(2);
+    expect(nativeCalls(graph, 'caller').flatMap(call => expansions(call)
+      .map(item => [item.configId, item.translationUnit, item.usr])).sort()).toEqual(expectedSupports);
   }, 30_000);
 
   it.skipIf(!runtimeAvailable)('keeps three conditional typedef alternatives while -D and -U activate only the real bindings', async () => {
@@ -215,6 +252,9 @@ describe('complex PR6 semantic lifecycle regressions', () => {
       { file: 'client.c', target: 'default', flags: [] as string[] },
     ];
     commands(root, rows);
+    const viewIds = new Map(buildCompileViews(loadCompilationDatabase(root)!)
+      .map(view => [view.key, view.id] as const));
+    expect([...viewIds.keys()].sort()).toEqual(['cmake:default', 'cmake:selected']);
     const graph = await indexed(root);
     const alternatives = graph.searchNodes('Callback', { kinds: ['type_alias'] }).filter(match => match.node.name === 'Callback');
     expect(alternatives).toHaveLength(3);
@@ -226,11 +266,15 @@ describe('complex PR6 semantic lifecycle regressions', () => {
     expect(contexts[1]!.conditions).toContain('#elif defined(WIDE_API)');
     expect(contexts[2]!.conditions).toContain('#else');
     expect(contexts.map(item => item.activeConfigIds.length)).toEqual([0, 1, 1]);
+    expect(contexts.map(item => item.activeConfigIds))
+      .toEqual([[], [viewIds.get('cmake:selected')], [viewIds.get('cmake:default')]]);
     expect(contexts.every(item => item.retainedConfigIds.length === 0)).toBe(true);
     expect(new Set(contexts.flatMap(item => item.activeConfigIds)).size).toBe(2);
     const wideId = contexts[1]!.nodeId;
     commands(root, [{ ...rows[0]!, flags: ['-DOLD_API'] }, rows[1]!]); await graph.sync();
     expect(contexts.map(item => graph.getCppTypedefContext(item.nodeId)!.activeConfigIds.length)).toEqual([1, 0, 1]);
+    expect(contexts.map(item => graph.getCppTypedefContext(item.nodeId)!.activeConfigIds))
+      .toEqual([[viewIds.get('cmake:selected')], [], [viewIds.get('cmake:default')]]);
     expect(contexts.map(item => graph.getCppTypedefContext(item.nodeId)!.retainedConfigIds.length)).toEqual([0, 0, 0]);
 
     // 删除 inactive alternative 时保留其余声明的物理行号，明确验证旧结构事实被清理。
@@ -240,6 +284,9 @@ describe('complex PR6 semantic lifecycle regressions', () => {
     const remaining = graph.searchNodes('Callback', { kinds: ['type_alias'] }).filter(match => match.node.name === 'Callback');
     expect(remaining).toHaveLength(2);
     expect(remaining.map(match => graph.getCppTypedefContext(match.node.id)!.activeConfigIds.length)).toEqual([1, 1]);
+    expect(remaining.map(match => graph.getCppTypedefContext(match.node.id)!)
+      .sort((a, b) => a.startLine - b.startLine).map(item => item.activeConfigIds))
+      .toEqual([[viewIds.get('cmake:selected')], [viewIds.get('cmake:default')]]);
   }, 30_000);
 
   it.skipIf(!runtimeAvailable)('retains shared external support through declaration EACCES and unavailable native runtime, then recovers', async () => {
